@@ -1,0 +1,17 @@
+# Ignore cloned third-party reference repositories
+research/repos/
+
+# Build artifacts
+build/
+*.o
+*.obj
+*.elf
+*.exe
+*.xex
+*.pdb
+src/linux_test/hci_probe
+src/linux_test/test_usb_transport
+src/linux_test/usbdevfs_probe
+src/linux_test/test_l2cap_ds4
+src/linux_test/ds4_live
+src/linux_test/test_manager_ui
