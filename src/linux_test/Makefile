@@ -1,7 +1,7 @@
 CC ?= gcc
 CFLAGS ?= -Wall -Wextra -Werror -O2 -std=c11 -I../hci -I../transport -I../hal -I../chipset -I../l2cap -I../hid -I../manager
 
-TARGETS := hci_probe test_usb_transport usbdevfs_probe test_l2cap_ds4 ds4_live test_manager_ui
+TARGETS := hci_probe test_usb_transport usbdevfs_probe test_l2cap_ds4 ds4_live test_manager_ui test_phase1
 
 all: $(TARGETS)
 
@@ -23,10 +23,14 @@ ds4_live: ds4_live.c ../l2cap/l2cap.c ../l2cap/l2cap.h ../hid/ds4_bt.c ../hid/ds
 test_manager_ui: test_manager_ui.c ../manager/bt_manager.c ../manager/bt_manager.h ../hid/ds4_bt.c ../hid/ds4_bt.h ../hci/hci_core.c ../hci/hci_core.h
 	$(CC) $(CFLAGS) test_manager_ui.c ../manager/bt_manager.c ../hid/ds4_bt.c ../hci/hci_core.c -o test_manager_ui
 
-test: test_usb_transport test_l2cap_ds4 test_manager_ui
+test_phase1: test_phase1.c ../manager/bt_phase1.c ../manager/bt_phase1.h
+	$(CC) $(CFLAGS) test_phase1.c ../manager/bt_phase1.c -o test_phase1
+
+test: test_usb_transport test_l2cap_ds4 test_manager_ui test_phase1
 	./test_usb_transport
 	./test_l2cap_ds4
 	./test_manager_ui
+	./test_phase1
 
 clean:
 	rm -f $(TARGETS)
