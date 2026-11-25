@@ -1,4 +1,5 @@
 #include "../manager/bt_phase1.h"
+#include "../manager/console_mailbox.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -276,6 +277,61 @@ static void test_phrase_bounds_and_null_decide(void)
     printf("[PASS] limites de phrase_id e decide(NULL)\n");
 }
 
+/* Ida e volta em memoria do registro de resposta (mesmo layout gravado em Mass0). */
+static bt_console_reply_t reply_round_trip(const bt_console_reply_t *in)
+{
+    uint8_t wire[sizeof(bt_console_reply_t)];
+    bt_console_reply_t out;
+    memcpy(wire, in, sizeof wire);
+    memcpy(&out, wire, sizeof out);
+    return out;
+}
+
+static void test_sta_01_mailbox_ready_phrase(void)
+{
+    const bt_console_reply_t in = {
+        .magic = BT_IPC_MAGIC, .version = BT_IPC_VERSION, .token = 1u,
+        .phrase_id = BT_PHRASE_ADAPTER_READY, .player = 0u, .pair_active = 0u,
+    };
+    const bt_console_reply_t out = reply_round_trip(&in);
+    assert(out.phrase_id == BT_PHRASE_ADAPTER_READY);
+    assert(out.player == 0u);
+    assert(!out.pair_active);
+    assert(bt_phase1_phrase_text(out.phrase_id) != NULL);
+    printf("[PASS] STA-01 mailbox pronto, jogador 0, sem pareamento\n");
+}
+
+static void test_sta_01_mailbox_disconnected_player2(void)
+{
+    const bt_console_reply_t in = {
+        .magic = BT_IPC_MAGIC, .version = BT_IPC_VERSION, .token = 2u,
+        .phrase_id = BT_PHRASE_ADAPTER_DISCONNECTED, .player = 2u, .pair_active = 1u,
+    };
+    const bt_console_reply_t out = reply_round_trip(&in);
+    assert(out.phrase_id == BT_PHRASE_ADAPTER_DISCONNECTED);
+    assert(out.player == 2u);
+    assert(out.pair_active);
+    printf("[PASS] STA-01 mailbox desconectado, jogador 2, pareamento ativo\n");
+}
+
+static void test_sta_01_mailbox_keeps_usb_and_stage(void)
+{
+    const bt_console_reply_t in = {
+        .magic = BT_IPC_MAGIC, .version = BT_IPC_VERSION, .token = 3u,
+        .usb_status = -5, .adapter_stage = 3u,
+        .phrase_id = BT_PHRASE_ADAPTER_NOT_FOUND, .player = 1u, .pair_active = 0u,
+    };
+    const bt_console_reply_t out = reply_round_trip(&in);
+    assert(out.usb_status == -5);
+    assert(out.adapter_stage == 3u);
+    assert(out.magic == BT_IPC_MAGIC && out.version == BT_IPC_VERSION && out.token == 3u);
+    /* phrase_id desconhecido nao vira texto novo: so a tabela da tarefa 01 resolve ids. */
+    bt_console_reply_t unknown = in;
+    unknown.phrase_id = 0xFFFFu;
+    assert(bt_phase1_phrase_text(reply_round_trip(&unknown).phrase_id) == NULL);
+    printf("[PASS] STA-01 mailbox preserva usb_status e adapter_stage\n");
+}
+
 int main(void)
 {
     test_adp_02_no_ugreen();
@@ -291,5 +347,8 @@ int main(void)
     test_err_01_adapter_removed();
     test_err_03_ds4_disconnect();
     test_phrase_bounds_and_null_decide();
+    test_sta_01_mailbox_ready_phrase();
+    test_sta_01_mailbox_disconnected_player2();
+    test_sta_01_mailbox_keeps_usb_and_stage();
     return 0;
 }
