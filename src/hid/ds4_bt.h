@@ -85,6 +85,17 @@ int ds4_bt_parse_hidp_mapped(const uint8_t *hidp, size_t len,
                              x360_gamepad_state_t *out_state,
                              uint32_t *out_raw_mask);
 
+/** Tamanho do quadro HIDP SET_REPORT Output 0x11 (mesmo de ds4_live.c). */
+#define DS4_BT_OUTPUT_REPORT_LEN 79u
+
+/**
+ * Monta o quadro HIDP SET_REPORT Output 0x11 com os dois motores de vibracao.
+ * Retorna DS4_BT_OUTPUT_REPORT_LEN em sucesso; 0 (sem escrever em out) se
+ * out for NULL ou out_len < DS4_BT_OUTPUT_REPORT_LEN. Nao envia nada ao console.
+ */
+size_t ds4_bt_build_rumble_report(uint8_t *out, size_t out_len,
+                                  uint8_t small_motor, uint8_t large_motor);
+
 #ifdef __cplusplus
 }
 #endif

@@ -114,6 +114,47 @@ static void test_l2cap_and_ds4(void) {
     printf("[PASS] L2CAP HID Control/Interrupt handshake + DS4 BT 0x11 report parser\n");
 }
 
+/* Offsets de referencia: ds4_live.c (HIDP SET_REPORT 0x52, ID 0x11, flags, motores) */
+#define RUM_OFF_HIDP   0
+#define RUM_OFF_ID     1
+#define RUM_OFF_FLAGS  4
+#define RUM_OFF_SMALL  7
+#define RUM_OFF_LARGE  8
+
+static void test_ds4_rumble_report(void) {
+    uint8_t buf[DS4_BT_OUTPUT_REPORT_LEN];
+
+    /* [RUM-01] motor grande 200 e motor pequeno 10 */
+    memset(buf, 0xEE, sizeof(buf));
+    size_t n = ds4_bt_build_rumble_report(buf, sizeof(buf), 10u, 200u);
+    assert(n == DS4_BT_OUTPUT_REPORT_LEN);
+    assert(buf[RUM_OFF_HIDP] == 0x52u);
+    assert(buf[RUM_OFF_ID] == 0x11u);
+    assert(buf[RUM_OFF_FLAGS] == 0x07u);
+    assert(buf[RUM_OFF_SMALL] == 10u);
+    assert(buf[RUM_OFF_LARGE] == 200u);
+    printf("[PASS] RUM-01 motor grande 200 e pequeno 10 geram 0x11 com os dois valores\n");
+
+    /* [RUM-01] os dois motores em 0 */
+    memset(buf, 0xEE, sizeof(buf));
+    n = ds4_bt_build_rumble_report(buf, sizeof(buf), 0u, 0u);
+    assert(n == DS4_BT_OUTPUT_REPORT_LEN);
+    assert(buf[RUM_OFF_ID] == 0x11u);
+    assert(buf[RUM_OFF_SMALL] == 0u);
+    assert(buf[RUM_OFF_LARGE] == 0u);
+    printf("[PASS] RUM-01 os dois motores em 0 geram 0x11 com os dois em 0\n");
+
+    /* [RUM-01] buffer menor que o quadro nao e escrito */
+    uint8_t sentinel[DS4_BT_OUTPUT_REPORT_LEN];
+    memset(sentinel, 0xEE, sizeof(sentinel));
+    memset(buf, 0xEE, sizeof(buf));
+    n = ds4_bt_build_rumble_report(buf, DS4_BT_OUTPUT_REPORT_LEN - 1u, 10u, 200u);
+    assert(n == 0u);
+    assert(memcmp(buf, sentinel, sizeof(buf)) == 0);
+    assert(ds4_bt_build_rumble_report(NULL, sizeof(buf), 10u, 200u) == 0u);
+    printf("[PASS] RUM-01 buffer menor que o quadro nao e escrito\n");
+}
+
 static int dummy_rtl_cmd(void *ctx, uint16_t opcode, const uint8_t *params, uint8_t param_len) {
     int *count = (int *)ctx;
     assert(opcode == RTL_OP_DOWNLOAD_CMD);
@@ -154,6 +195,7 @@ static void test_rtl_fw_parser(void) {
 
 int main(void) {
     test_l2cap_and_ds4();
+    test_ds4_rumble_report();
     test_rtl_fw_parser();
     return 0;
 }

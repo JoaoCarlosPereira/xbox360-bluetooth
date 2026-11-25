@@ -157,6 +157,22 @@ int ds4_bt_parse_hidp_mapped(const uint8_t *hidp, size_t len,
     return 0;
 }
 
+size_t ds4_bt_build_rumble_report(uint8_t *out, size_t out_len,
+                                  uint8_t small_motor, uint8_t large_motor) {
+    if (!out || out_len < DS4_BT_OUTPUT_REPORT_LEN) {
+        return 0u;
+    }
+    /* Offsets iguais a ds4_live.c: 0x52, 0x11, 0xC0, 0x00, flags 0x07, motores em 7 e 8 */
+    memset(out, 0, DS4_BT_OUTPUT_REPORT_LEN);
+    out[0] = 0x52u; /* HIDP SET_REPORT | OUTPUT */
+    out[1] = 0x11u; /* Report ID */
+    out[2] = 0xC0u;
+    out[4] = 0x07u; /* habilita rumble/LED */
+    out[7] = small_motor;
+    out[8] = large_motor;
+    return DS4_BT_OUTPUT_REPORT_LEN;
+}
+
 int ds4_bt_parse_hidp_report(const uint8_t *hidp, size_t len,
                              x360_gamepad_state_t *out_state) {
     return ds4_bt_parse_hidp_mapped(hidp, len, NULL, out_state, NULL);
