@@ -13,6 +13,7 @@ extern "C" {
 #define HCI_OP_INQUIRY                  0x0401u
 #define HCI_OP_INQUIRY_CANCEL           0x0402u
 #define HCI_OP_CREATE_CONNECTION        0x0405u
+#define HCI_OP_LINK_KEY_REQ_REPLY       0x040Bu
 #define HCI_OP_LINK_KEY_REQ_NEG_REPLY   0x040Cu
 #define HCI_OP_IO_CAP_REQ_REPLY         0x042Bu
 #define HCI_OP_USER_CONFIRM_REQ_REPLY   0x042Cu
@@ -96,6 +97,13 @@ static inline uint16_t hci_get_le16(const uint8_t *src) {
  */
 size_t hci_build_command(uint8_t *out_buf, size_t out_cap,
                          uint16_t opcode, const uint8_t *params, uint8_t param_len);
+
+/**
+ * Build HCI_Link_Key_Request_Reply (0x040B): BD_ADDR (wire order) + 16-byte Link Key.
+ * Returns total byte length written to out_buf, or 0 on error.
+ */
+size_t hci_build_link_key_reply(uint8_t *out_buf, size_t out_cap,
+                                const uint8_t bd_addr[6], const uint8_t link_key[16]);
 
 /**
  * Parse a raw HCI Command Complete event (starting at event_code 0x0E).

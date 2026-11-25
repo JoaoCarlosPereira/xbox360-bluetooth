@@ -32,6 +32,7 @@ typedef struct {
     uint8_t  bd_addr[6];
     uint8_t  link_key[16];
     uint8_t  key_type;
+    uint8_t  player;          /* 1 ou 2 quando atribuido; 0 = sem jogador */
     uint32_t class_of_device;
     char     name[32];
 } bt_paired_device_t;
@@ -109,6 +110,18 @@ int bt_manager_upsert_paired(bt_ipc_state_t *ipc, const uint8_t bd_addr[6],
 const bt_paired_device_t *bt_manager_find_paired(const bt_ipc_state_t *ipc,
                                                  const uint8_t bd_addr[6]);
 int bt_manager_forget_paired(bt_ipc_state_t *ipc, const uint8_t bd_addr[6]);
+
+/* Registro de um unico DualShock 4 (PAR-05 / LIM-01).
+ * Retorna indice >= 0 em sucesso; -1 argumento invalido (player fora de 1..2);
+ * -3 se ja existe outro endereco gravado (o registro existente e preservado). */
+int bt_manager_store_single_ds4(bt_ipc_state_t *ipc, const uint8_t bd_addr[6],
+                                const uint8_t link_key[16], uint8_t key_type,
+                                uint8_t player, const char *name);
+
+/* Resposta positiva de link key (HCI 0x040B) para o endereco gravado.
+ * Retorna o tamanho do comando escrito em out_buf, ou 0 se bd_addr nao esta gravado. */
+size_t bt_manager_build_link_key_reply(const bt_ipc_state_t *ipc, const uint8_t bd_addr[6],
+                                       uint8_t *out_buf, size_t out_cap);
 
 /* Active player slot management (up to 4 controllers) */
 int bt_manager_assign_slot(bt_ipc_state_t *ipc, const uint8_t bd_addr[6],

@@ -66,6 +66,31 @@ int bt_manager_forget_paired(bt_ipc_state_t *ipc, const uint8_t bd_addr[6]) {
     return -2;
 }
 
+int bt_manager_store_single_ds4(bt_ipc_state_t *ipc, const uint8_t bd_addr[6],
+                                const uint8_t link_key[16], uint8_t key_type,
+                                uint8_t player, const char *name) {
+    if (!ipc || !bd_addr || !link_key || player < 1u || player > 2u) return -1;
+
+    /* LIM-01: um unico DualShock 4; outro endereco gravado recusa a escrita. */
+    for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
+        if (ipc->paired[i].valid && memcmp(ipc->paired[i].bd_addr, bd_addr, 6u) != 0) {
+            return -3;
+        }
+    }
+
+    int idx = bt_manager_upsert_paired(ipc, bd_addr, link_key, key_type, 0x002508u, name);
+    if (idx < 0) return idx;
+    ipc->paired[idx].player = player;
+    return idx;
+}
+
+size_t bt_manager_build_link_key_reply(const bt_ipc_state_t *ipc, const uint8_t bd_addr[6],
+                                       uint8_t *out_buf, size_t out_cap) {
+    const bt_paired_device_t *d = bt_manager_find_paired(ipc, bd_addr);
+    if (!d) return 0;
+    return hci_build_link_key_reply(out_buf, out_cap, d->bd_addr, d->link_key);
+}
+
 int bt_manager_assign_slot(bt_ipc_state_t *ipc, const uint8_t bd_addr[6],
                            uint16_t acl_handle, const char *name) {
     if (!ipc || !bd_addr) return -1;
@@ -163,6 +188,15 @@ size_t bt_manager_export_ini(const bt_ipc_state_t *ipc, char *out_buf, size_t ca
         pos = append_str(out_buf, cap, pos, ",");
         pos = append_str(out_buf, cap, pos, d->name[0] ? d->name : "Controller");
         pos = append_str(out_buf, cap, pos, "\n");
+
+        /* Format: player=<BD_ADDR_12HEX>,<PLAYER_2HEX>\n (somente com jogador 1 ou 2) */
+        if (d->player >= 1u && d->player <= 2u) {
+            pos = append_str(out_buf, cap, pos, "player=");
+            pos = append_hex_bytes(out_buf, cap, pos, d->bd_addr, 6u, true);
+            pos = append_str(out_buf, cap, pos, ",");
+            pos = append_hex_bytes(out_buf, cap, pos, &d->player, 1u, false);
+            pos = append_str(out_buf, cap, pos, "\n");
+        }
     }
     out_buf[pos] = '\0';
     return pos;
@@ -207,8 +241,28 @@ int bt_manager_import_ini(bt_ipc_state_t *ipc, const char *ini_text, size_t len)
                 if (nlen >= sizeof(name)) nlen = sizeof(name) - 1u;
                 memcpy(name, line + 53u, nlen);
                 name[nlen] = '\0';
-                if (bt_manager_upsert_paired(ipc, bd, lk, kt, 0x002508u, name) >= 0) {
+                /* LIM-01: um segundo endereco no arquivo e ignorado. */
+                bool other_stored = false;
+                for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
+                    if (ipc->paired[i].valid && memcmp(ipc->paired[i].bd_addr, bd, 6u) != 0) {
+                        other_stored = true;
+                        break;
+                    }
+                }
+                if (!other_stored &&
+                    bt_manager_upsert_paired(ipc, bd, lk, kt, 0x002508u, name) >= 0) {
                     loaded++;
+                }
+            }
+        } else if (line_len >= 22u && memcmp(line, "player=", 7u) == 0 && line[19] == ',') {
+            uint8_t bd[6], pl = 0;
+            if (parse_hex_seq(line + 7u, bd, 6u, true) &&
+                parse_hex_seq(line + 20u, &pl, 1u, false) && pl >= 1u && pl <= 2u) {
+                for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
+                    if (ipc->paired[i].valid && memcmp(ipc->paired[i].bd_addr, bd, 6u) == 0) {
+                        ipc->paired[i].player = pl;
+                        break;
+                    }
                 }
             }
         }

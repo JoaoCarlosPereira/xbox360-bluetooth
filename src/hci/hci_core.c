@@ -18,6 +18,18 @@ size_t hci_build_command(uint8_t *out_buf, size_t out_cap,
     return (size_t)(HCI_CMD_HDR_SIZE + param_len);
 }
 
+size_t hci_build_link_key_reply(uint8_t *out_buf, size_t out_cap,
+                                const uint8_t bd_addr[6], const uint8_t link_key[16]) {
+    if (!bd_addr || !link_key) {
+        return 0;
+    }
+    uint8_t params[22];
+    memcpy(params, bd_addr, 6u);
+    memcpy(params + 6, link_key, 16u);
+    return hci_build_command(out_buf, out_cap, HCI_OP_LINK_KEY_REQ_REPLY,
+                             params, (uint8_t)sizeof(params));
+}
+
 int hci_parse_command_complete(const uint8_t *evt_buf, size_t evt_len,
                                hci_cmd_complete_t *out_cc) {
     if (!evt_buf || !out_cc || evt_len < 5u) {
