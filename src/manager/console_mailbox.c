@@ -32,7 +32,7 @@ static bool transfer(const char *path, uint16_t path_size, void *output,
 bool bt_console_read_request(bt_console_request_t *request) {
     return transfer(REQUEST_FILE, sizeof REQUEST_FILE, request, NULL, sizeof *request) &&
            request->magic == BT_IPC_MAGIC && request->version == BT_IPC_VERSION &&
-           request->token != 0 && request->command <= BT_IPC_CMD_FORGET_PAIRED;
+           request->token != 0 && request->command <= BT_IPC_CMD_SET_PLAYER;
 }
 
 bool bt_console_write_request(const bt_console_request_t *request) {
@@ -46,4 +46,14 @@ bool bt_console_read_reply(bt_console_reply_t *reply) {
 
 bool bt_console_write_reply(const bt_console_reply_t *reply) {
     return transfer(REPLY_FILE, sizeof REPLY_FILE, NULL, reply, sizeof *reply);
+}
+
+#define SCAN_FILE "\\Device\\Mass0\\bt360_scan.bin"
+
+bool bt_scan_write_file(const uint8_t *bytes) {
+    return bytes && transfer(SCAN_FILE, sizeof SCAN_FILE, NULL, bytes, BT_SCAN_FILE_BYTES);
+}
+
+bool bt_scan_read_file(uint8_t *bytes) {
+    return bytes && transfer(SCAN_FILE, sizeof SCAN_FILE, bytes, NULL, BT_SCAN_FILE_BYTES);
 }
