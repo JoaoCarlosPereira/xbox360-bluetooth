@@ -142,6 +142,7 @@ static void test_ds4_rumble_report(void) {
     assert(buf[RUM_OFF_ID] == 0x11u);
     assert(buf[RUM_OFF_SMALL] == 0u);
     assert(buf[RUM_OFF_LARGE] == 0u);
+    assert(buf[75] == 0x3eu && buf[76] == 0x39u && buf[77] == 0x2au && buf[78] == 0x51u);
     printf("[PASS] RUM-01 os dois motores em 0 geram 0x11 com os dois em 0\n");
 
     /* [RUM-01] buffer menor que o quadro nao e escrito */
@@ -164,10 +165,45 @@ static int dummy_rtl_cmd(void *ctx, uint16_t opcode, const uint8_t *params, uint
     return 0;
 }
 
+static int check_synthetic_fw(void *ctx, uint16_t opcode, const uint8_t *params, uint8_t len) {
+    static const uint8_t expected[] = { 0x80, 0xaa, 0xbb, 0xcc, 0xdd,
+                                        0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc };
+    int *count = (int *)ctx;
+    assert(opcode == RTL_OP_DOWNLOAD_CMD);
+    assert(len == sizeof(expected));
+    assert(memcmp(params, expected, sizeof(expected)) == 0);
+    (*count)++;
+    return 0;
+}
+
+static void test_rtl_fw_synthetic(void) {
+    uint8_t fw[] = { 'R','e','a','l','t','e','c','h', 0x12,0x34,0x56,0x78,
+                     1,0, 2,0, 8,0, 22,0,0,0,
+                     0xaa,0xbb,0xcc,0xdd, 0,0,0,0 };
+    const uint8_t config[] = { 0x9a, 0xbc };
+    rtl_fw_image_t img;
+    int sent = 0;
+    assert(rtl_fw_prepare(&img, fw, sizeof(fw), config, sizeof(config), 1) == 0);
+    assert(rtl_fw_chunk_count(&img) == 1);
+    assert(rtl_fw_send_chunk(&img, 0, check_synthetic_fw, &sent) == 0);
+    assert(sent == 1);
+    assert(rtl_fw_send_chunk(&img, 1, check_synthetic_fw, &sent) == -2);
+    assert(rtl_fw_prepare(&img, fw, sizeof(fw), config, sizeof(config), 2) == -5);
+    fw[18] = 0xff; /* Invalid patch offset */
+    assert(rtl_fw_prepare(&img, fw, sizeof(fw), config, sizeof(config), 1) == -4);
+    printf("[PASS] Synthetic EPATCH selection, version patch and bounds\n");
+}
+
 static void test_rtl_fw_parser(void) {
-    FILE *f = fopen("/lib/firmware/rtl_bt/rtl8761bu_fw.bin", "rb");
+    const char *path = getenv("RTL_FIRMWARE");
+    if (!path) path = "/lib/firmware/rtl_bt/rtl8761bu_fw.bin";
+    FILE *f = fopen(path, "rb");
     if (!f) {
-        printf("[SKIP] Realtek firmware file not found on host\n");
+        if (getenv("RTL_FIRMWARE")) {
+            perror("RTL_FIRMWARE");
+            exit(1);
+        }
+        printf("[SKIP] Realtek firmware not found; set RTL_FIRMWARE to an uncompressed image\n");
         return;
     }
     fseek(f, 0, SEEK_END);
@@ -180,22 +216,23 @@ static void test_rtl_fw_parser(void) {
     uint8_t cfg[6] = { 0 };
     rtl_fw_image_t img;
     assert(rtl_fw_prepare(&img, fw, (size_t)sz, cfg, sizeof(cfg), 1) == 0);
-    assert(img.total_len == 27814u);
+    assert(img.total_len == (size_t)img.patch_len + sizeof(cfg));
     size_t chunks = rtl_fw_chunk_count(&img);
-    assert(chunks == 111u);
+    assert(chunks > 0);
 
     int sent = 0;
     for (size_t i = 0; i < chunks; i++) {
         assert(rtl_fw_send_chunk(&img, i, dummy_rtl_cmd, &sent) == 0);
     }
-    assert(sent == 111);
+    assert((size_t)sent == chunks);
     free(fw);
-    printf("[PASS] Realtek RTL8761BU EPATCH parser (27814 bytes, 111 chunks)\n");
+    printf("[PASS] Realtek RTL8761BU EPATCH parser (%zu bytes, %zu chunks)\n", img.total_len, chunks);
 }
 
 int main(void) {
     test_l2cap_and_ds4();
     test_ds4_rumble_report();
+    test_rtl_fw_synthetic();
     test_rtl_fw_parser();
     return 0;
 }
