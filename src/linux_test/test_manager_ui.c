@@ -1,5 +1,6 @@
 #include "../hid/ds4_bt.h"
 #include "../manager/bt_manager.h"
+#include "../manager/bt_phase1.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -64,12 +65,16 @@ static void test_par05_player_roundtrip(void) {
     assert(memcmp(found->link_key, k_ds4_key, 16u) == 0);
     assert(found->class_of_device == 0x002508u);
 
-    /* Jogador fora de 1..2 e recusado e nada e gravado. */
+    /* Jogador fora de 1..4 e recusado e nada e gravado. 3 e 4 passam. */
     bt_ipc_state_t bad;
     bt_ipc_init(&bad);
     assert(bt_manager_store_single_ds4(&bad, k_ds4_a, k_ds4_key, 0x05, 0u, "DS4-A") == -1);
-    assert(bt_manager_store_single_ds4(&bad, k_ds4_a, k_ds4_key, 0x05, 3u, "DS4-A") == -1);
+    assert(bt_manager_store_single_ds4(&bad, k_ds4_a, k_ds4_key, 0x05, 5u, "DS4-A") == -1);
     assert(bt_manager_find_paired(&bad, k_ds4_a) == NULL);
+    assert(bt_manager_store_single_ds4(&bad, k_ds4_a, k_ds4_key, 0x05, 3u, "DS4-A") == 0);
+    assert(bt_manager_find_paired(&bad, k_ds4_a)->player == 3u);
+    assert(bt_manager_store_single_ds4(&bad, k_ds4_a, k_ds4_key, 0x05, 4u, "DS4-A") == 0);
+    assert(bt_manager_find_paired(&bad, k_ds4_a)->player == 4u);
 
     printf("[PASS] PAR-05 endereco e Jogador 2 gravados e relidos do INI\n");
 }
@@ -101,21 +106,20 @@ static void test_par05_player1_roundtrip(void) {
     printf("[PASS] PAR-05 endereco, link key e Jogador 1 gravados e relidos do INI\n");
 }
 
-/* [PAR-05] player= fora de 1..2 no INI nao e jogador atribuido. */
+/* [PAR-05] player= fora de 1..4 no INI nao e jogador atribuido. 3 e 4 valem. */
 static void test_par05_import_rejects_invalid_player(void) {
     const char *dev = "dev=202992822F67,A0A1A2A3A4A5A6A7A8A9AAABACADAEAF,05,DS4-A\n";
     char ini[256];
     bt_ipc_state_t ipc;
     const bt_paired_device_t *found;
 
-    /* player=03 sozinho: registro importado, sem jogador. */
+    /* player=03 sozinho: Jogador 3. */
     snprintf(ini, sizeof(ini), "%splayer=202992822F67,03\n", dev);
     bt_ipc_init(&ipc);
     assert(bt_manager_import_ini(&ipc, ini, strlen(ini)) == 1);
     found = bt_manager_find_paired(&ipc, k_ds4_a);
     assert(found != NULL);
-    assert(found->player != 3u);
-    assert(found->player == 0u);
+    assert(found->player == 3u);
 
     /* player=00 sozinho: nao e Jogador 1 nem 2. */
     snprintf(ini, sizeof(ini), "%splayer=202992822F67,00\n", dev);
@@ -126,18 +130,18 @@ static void test_par05_import_rejects_invalid_player(void) {
     assert(found->player == 0u);
     assert(found->player != 1u && found->player != 2u);
 
-    /* Linha invalida depois de um jogador valido nao sobrescreve o jogador (03 e 00). */
+    /* 03 depois de 01 passa o controle para o Jogador 3. 00 nao sobrescreve. */
     snprintf(ini, sizeof(ini), "%splayer=202992822F67,01\nplayer=202992822F67,03\n", dev);
     bt_ipc_init(&ipc);
     assert(bt_manager_import_ini(&ipc, ini, strlen(ini)) == 1);
-    assert(bt_manager_find_paired(&ipc, k_ds4_a)->player == 1u);
+    assert(bt_manager_find_paired(&ipc, k_ds4_a)->player == 3u);
 
     snprintf(ini, sizeof(ini), "%splayer=202992822F67,02\nplayer=202992822F67,00\n", dev);
     bt_ipc_init(&ipc);
     assert(bt_manager_import_ini(&ipc, ini, strlen(ini)) == 1);
     assert(bt_manager_find_paired(&ipc, k_ds4_a)->player == 2u);
 
-    printf("[PASS] PAR-05 import ignora player= 00 e 03 (fora de 1..2)\n");
+    printf("[PASS] PAR-05 import aceita player 1..4 e ignora 00\n");
 }
 
 /* [PAR-05] A resposta positiva (0x040B) para A traz os 16 bytes gravados. */
@@ -161,7 +165,7 @@ static void test_par05_link_key_reply(void) {
     printf("[PASS] PAR-05 resposta de link key 0x040B com os 16 bytes gravados\n");
 }
 
-/* [LIM-01] Gravar B enquanto A existe falha e A permanece o unico registro. */
+/* Ate quatro enderecos. O quinto e recusado e os quatro permanecem. */
 static void test_lim01_second_address_refused(void) {
     bt_ipc_state_t ipc;
     bt_ipc_init(&ipc);
@@ -169,32 +173,41 @@ static void test_lim01_second_address_refused(void) {
 
     const uint8_t other_key[16] = { 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x99, 0x88,
                                     0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00 };
-    assert(bt_manager_store_single_ds4(&ipc, k_ds4_b, other_key, 0x05, 1u, "DS4-B") < 0);
-    assert(bt_manager_find_paired(&ipc, k_ds4_b) == NULL);
+    assert(bt_manager_store_single_ds4(&ipc, k_ds4_b, other_key, 0x05, 1u, "DS4-B") >= 0);
+    assert(bt_manager_find_paired(&ipc, k_ds4_b) != NULL);
+    assert(bt_manager_find_paired(&ipc, k_ds4_b)->player == 1u);
+    assert(bt_manager_find_paired(&ipc, k_ds4_a)->player == 2u);
 
-    size_t count = 0;
-    for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
-        if (ipc.paired[i].valid) count++;
-    }
-    assert(count == 1u);
-    const bt_paired_device_t *a = bt_manager_find_paired(&ipc, k_ds4_a);
-    assert(a != NULL && a->player == 2u && memcmp(a->link_key, k_ds4_key, 16u) == 0);
+    const uint8_t c[6] = { 3, 3, 3, 3, 3, 3 };
+    const uint8_t d[6] = { 4, 4, 4, 4, 4, 4 };
+    const uint8_t e[6] = { 5, 5, 5, 5, 5, 5 };
+    assert(bt_manager_store_single_ds4(&ipc, c, other_key, 0x05, 3u, "DS4-C") >= 0);
+    assert(bt_manager_store_single_ds4(&ipc, d, other_key, 0x05, 4u, "DS4-D") >= 0);
+    assert(bt_manager_store_single_ds4(&ipc, e, other_key, 0x05, 1u, "DS4-E") == -3);
+    assert(bt_manager_find_paired(&ipc, e) == NULL);
+    assert(bt_manager_paired_count(&ipc) == 4);
+    assert(bt_manager_find_paired(&ipc, k_ds4_a)->player == 2u);
 
-    /* Regravar o mesmo endereco A continua permitido (atualiza o registro). */
+    /* Regravar o mesmo endereco A continua permitido e troca com quem ocupa o jogador. */
     assert(bt_manager_store_single_ds4(&ipc, k_ds4_a, other_key, 0x05, 1u, "DS4-A") == 0);
+    assert(bt_manager_find_paired(&ipc, k_ds4_a)->player == 1u);
+    assert(memcmp(bt_manager_find_paired(&ipc, k_ds4_a)->link_key, other_key, 16u) == 0);
+    assert(bt_manager_find_paired(&ipc, k_ds4_b)->player == 2u);
+    assert(bt_manager_set_player(&ipc, k_ds4_a, 3u) >= 0);
+    assert(bt_manager_find_paired(&ipc, k_ds4_a)->player == 3u);
+    assert(bt_manager_find_paired(&ipc, c)->player == 1u);
 
-    /* Um INI com dois dispositivos carrega somente o primeiro. */
     const char *two =
         "dev=202992822F67,A0A1A2A3A4A5A6A7A8A9AAABACADAEAF,05,DS4-A\n"
         "player=202992822F67,02\n"
         "dev=060504030201,FFEEDDCCBBAA99887766554433221100,05,DS4-B\n";
     bt_ipc_state_t loaded;
     bt_ipc_init(&loaded);
-    assert(bt_manager_import_ini(&loaded, two, strlen(two)) == 1);
+    assert(bt_manager_import_ini(&loaded, two, strlen(two)) == 2);
     assert(bt_manager_find_paired(&loaded, k_ds4_a) != NULL);
-    assert(bt_manager_find_paired(&loaded, k_ds4_b) == NULL);
+    assert(bt_manager_find_paired(&loaded, k_ds4_b) != NULL);
 
-    printf("[PASS] LIM-01 segundo endereco recusado, A segue unico registro\n");
+    printf("[PASS] quatro controles gravados, o quinto recusado, A permanece\n");
 }
 
 /* [PAR-05] Arquivo vazio nao produz resposta positiva. */
@@ -235,16 +248,21 @@ static void test_slots_and_ui_ipc(void) {
     bt_ui_handle_input(&ui, &ipc, X360_BTN_Y);
     assert(ipc.cmd == BT_IPC_CMD_START_SCAN && ipc.cmd_seq == 1);
 
-    /* Press A on scan item 0 -> PAIR_AND_CONNECT */
+    /* Direita entra na lista; A no item 0 pareia */
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_RIGHT);
+    assert(ui.content_focused && ui.cursor == 0);
     bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
     assert(ipc.cmd == BT_IPC_CMD_PAIR_AND_CONNECT && ipc.cmd_seq == 2);
     assert(memcmp(ipc.cmd_bd_addr, bd_a, 6u) == 0);
 
-    /* Navigate Left -> PAIRED -> SLOTS, press X on slot 0 -> DISCONNECT_SLOT */
+    /* Esquerda volta ao menu; cima sobe Buscar -> Pareados -> Controles */
     bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_LEFT);
+    assert(!ui.content_focused && ui.pane == BT_UI_PANE_SCAN);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_UP);
     assert(ui.pane == BT_UI_PANE_PAIRED);
-    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_LEFT);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_UP);
     assert(ui.pane == BT_UI_PANE_SLOTS);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_RIGHT);
     bt_ui_handle_input(&ui, &ipc, X360_BTN_X);
     assert(ipc.cmd == BT_IPC_CMD_DISCONNECT_SLOT && ipc.cmd_slot == 0);
 
@@ -253,6 +271,42 @@ static void test_slots_and_ui_ipc(void) {
     assert(ui.exit_requested);
 
     printf("[PASS] 4-player slot manager & NXE UI navigation/IPC commands\n");
+}
+
+static void test_dpad_follows_the_screen(void) {
+    bt_ipc_state_t ipc;
+    bt_ipc_init(&ipc);
+    bt_ui_model_t ui;
+    bt_ui_model_init(&ui);
+
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_UP);
+    assert(ui.pane == BT_UI_PANE_PAIRED && !ui.content_focused);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_UP);
+    assert(ui.pane == BT_UI_PANE_SLOTS);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_UP);
+    assert(ui.pane == BT_UI_PANE_SLOTS);
+
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_RIGHT);
+    assert(ui.content_focused && ui.cursor == 0);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_RIGHT);
+    assert(ui.cursor == 1);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_DOWN);
+    assert(ui.cursor == 3);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_UP);
+    assert(ui.cursor == 1);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_LEFT);
+    assert(ui.cursor == 0 && ui.content_focused);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_LEFT);
+    assert(!ui.content_focused && ui.pane == BT_UI_PANE_SLOTS);
+
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_DOWN);
+    assert(ui.pane == BT_UI_PANE_PAIRED);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_DOWN);
+    assert(ui.pane == BT_UI_PANE_SCAN);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_DOWN);
+    assert(ui.pane == BT_UI_PANE_SCAN);
+
+    printf("[PASS] direcional segue o menu vertical e a grade 2x2\n");
 }
 
 static void test_interactive_button_remap(void) {
@@ -286,6 +340,181 @@ static void test_interactive_button_remap(void) {
     printf("[PASS] Interactive 1-by-1 button remap wizard & custom mapping parser\n");
 }
 
+/* [Tarefa 07] Sem DS4 gravado, A em "Buscar" pede o primeiro pareamento (sem endereco). */
+static void test_first_pairing_requests_pair_and_connect(void) {
+    static const uint8_t zero[6] = { 0 };
+    bt_ipc_state_t ipc;
+    bt_ipc_init(&ipc);
+    assert(!bt_manager_has_stored_ds4(&ipc));
+
+    bt_ui_model_t ui;
+    bt_ui_model_init(&ui);
+    assert(ui.pane == BT_UI_PANE_SCAN && !ui.content_focused);
+
+    /* Menu focado: A na aba Buscar nao envia comando e nao mexe na navegacao. */
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
+    assert(ipc.cmd_seq == 0u && ipc.cmd == BT_IPC_CMD_NONE);
+    assert(!ui.content_focused && ui.pane == BT_UI_PANE_SCAN);
+
+    /* Painel focado (lista vazia, sem DS4 gravado): A pede o primeiro pareamento. */
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_RIGHT);
+    assert(ui.content_focused);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
+    assert(ipc.cmd_seq == 1u);
+    assert(ipc.cmd == BT_IPC_CMD_PAIR_AND_CONNECT);
+    assert(memcmp(ipc.cmd_bd_addr, zero, 6u) == 0);
+    assert(ui.content_focused);
+
+    /* Voltando ao menu (esquerda), A volta a nao enviar nada. */
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_LEFT);
+    assert(!ui.content_focused);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
+    assert(ipc.cmd_seq == 1u);
+
+    /* Nas outras abas com o menu focado, A e X nao enviam nada. */
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_UP); /* Pareados */
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_X);
+    assert(ipc.cmd_seq == 1u);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_UP); /* Controles */
+    assert(bt_manager_assign_slot(&ipc, k_ds4_a, 0x0001u, "DS4-A") == 0);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_X);
+    assert(ipc.cmd_seq == 1u && !ui.content_focused);
+
+    printf("[PASS] tarefa 07: sem DS4 gravado, A pede PAIR_AND_CONNECT\n");
+}
+
+/* [Tarefa 07] Com DS4 gravado, nenhuma acao oferece novo pareamento. */
+static void test_stored_ds4_does_not_offer_pairing(void) {
+    bt_ipc_state_t ipc;
+    bt_ipc_init(&ipc);
+    assert(bt_manager_store_single_ds4(&ipc, k_ds4_a, k_ds4_key, 0x05, 1u, "DS4-A") == 0);
+    assert(bt_manager_has_stored_ds4(&ipc));
+
+    bt_ui_model_t ui;
+    bt_ui_model_init(&ui);
+
+    /* Aba Buscar: A com menu focado e com painel focado, com e sem item na lista. */
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
+    assert(ipc.cmd_seq == 0u && ipc.cmd == BT_IPC_CMD_NONE);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_RIGHT);
+    assert(ui.content_focused);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
+    assert(ipc.cmd_seq == 1u && ipc.cmd == BT_IPC_CMD_PAIR_AND_CONNECT);
+
+    ipc.scan_count = 1;
+    memcpy(ipc.scan_items[0].bd_addr, k_ds4_b, 6u);
+    snprintf(ipc.scan_items[0].name, sizeof(ipc.scan_items[0].name), "Wireless Controller");
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
+    assert(ui.content_focused && ui.cursor == 0);
+    assert(ipc.cmd_seq == 2u && ipc.cmd == BT_IPC_CMD_PAIR_AND_CONNECT);
+
+    /* Gravar o DS4 depois de um pedido anterior tambem fecha a porta. */
+    bt_ipc_state_t later;
+    bt_ipc_init(&later);
+    bt_ui_model_init(&ui);
+    bt_ui_handle_input(&ui, &later, X360_BTN_DPAD_RIGHT);
+    bt_ui_handle_input(&ui, &later, X360_BTN_A);
+    assert(later.cmd_seq == 1u && later.cmd == BT_IPC_CMD_PAIR_AND_CONNECT);
+    assert(bt_manager_store_single_ds4(&later, k_ds4_a, k_ds4_key, 0x05, 2u, "DS4-A") == 0);
+    bt_ui_handle_input(&ui, &later, X360_BTN_A);
+    assert(later.cmd_seq == 2u && later.cmd == BT_IPC_CMD_PAIR_AND_CONNECT);
+    const uint8_t c[6] = { 3, 3, 3, 3, 3, 3 };
+    const uint8_t d[6] = { 4, 4, 4, 4, 4, 4 };
+    const uint8_t e[6] = { 5, 5, 5, 5, 5, 5 };
+    assert(bt_manager_store_single_ds4(&later, c, k_ds4_key, 0x05, 1u, "C") >= 0);
+    assert(bt_manager_store_single_ds4(&later, d, k_ds4_key, 0x05, 3u, "D") >= 0);
+    assert(bt_manager_store_single_ds4(&later, e, k_ds4_key, 0x05, 4u, "E") >= 0);
+    bt_ui_handle_input(&ui, &later, X360_BTN_A);
+    assert(later.cmd_seq == 2u);
+
+    /* Reconectar o DS4 gravado (aba Pareados) continua disponivel. */
+    bt_ui_model_init(&ui);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_UP);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_RIGHT);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
+    assert(ipc.cmd_seq == 3u && ipc.cmd == BT_IPC_CMD_CONNECT_PAIRED);
+
+    printf("[PASS] tarefa 07: pareia ate quatro; o quinto nao oferece pareamento\n");
+}
+
+/* [Tarefa 07] phrase_id do reply vira o texto exato da tabela da tarefa 01. */
+static void test_reply_phrase_becomes_exact_text(void) {
+    static const struct {
+        uint32_t    id;
+        const char *text;
+    } k_cases[] = {
+        { BT_PHRASE_DS4_PAIRED_PLAYER2, "DualShock 4 pareado no Jogador 2" },
+        { BT_PHRASE_DS4_PAIRED_PLAYER1, "DualShock 4 pareado no Jogador 1" },
+        { BT_PHRASE_DS4_PAIR_FAILED,    "Falha ao parear o DualShock 4." },
+        { BT_PHRASE_DS4_ALREADY_PAIRED, "Já existe um DualShock 4 pareado." },
+    };
+    for (size_t i = 0; i < sizeof(k_cases) / sizeof(k_cases[0]); i++) {
+        bt_ipc_state_t ipc;
+        bt_ipc_init(&ipc);
+        assert(bt_ui_apply_reply_phrase(&ipc, k_cases[i].id));
+        assert(strcmp(ipc.status_msg, k_cases[i].text) == 0);
+        /* Mesmo texto da tabela da tarefa 01: nada reescrito na UI. */
+        assert(strcmp(ipc.status_msg, bt_phase1_phrase_text(k_cases[i].id)) == 0);
+    }
+
+    /* Sem frase de pareamento, a mensagem anterior nao e tocada. */
+    bt_ipc_state_t ipc;
+    bt_ipc_init(&ipc);
+    snprintf(ipc.status_msg, sizeof(ipc.status_msg), "mensagem anterior");
+    assert(!bt_ui_apply_reply_phrase(&ipc, BT_PHRASE_NONE));
+    assert(strcmp(ipc.status_msg, "mensagem anterior") == 0);
+    assert(!bt_ui_apply_reply_phrase(&ipc, 0xFFFFu));
+    assert(strcmp(ipc.status_msg, "mensagem anterior") == 0);
+    assert(!bt_ui_apply_reply_phrase(NULL, BT_PHRASE_DS4_PAIR_FAILED));
+
+    assert(bt_ui_apply_reply_phrase(&ipc, BT_PHRASE_DS4_DISCONNECTED));
+    assert(strcmp(ipc.status_msg, "DualShock 4 desconectado.") == 0);
+
+    printf("[PASS] tarefa 07: phrase_id do reply vira o texto exato da tabela\n");
+}
+
+/* [Tarefa 07] Frase de adaptador no reply nunca substitui o status ja mostrado. */
+static void test_adapter_phrase_keeps_status(void) {
+    static const uint32_t k_adapter[] = {
+        BT_PHRASE_ADAPTER_READY, BT_PHRASE_ADAPTER_NOT_FOUND,
+        BT_PHRASE_ADAPTER_WRONG, BT_PHRASE_ADAPTER_DISCONNECTED,
+    };
+    for (size_t i = 0; i < sizeof(k_adapter) / sizeof(k_adapter[0]); i++) {
+        bt_ipc_state_t ipc;
+        bt_ipc_init(&ipc);
+        snprintf(ipc.status_msg, sizeof(ipc.status_msg), "texto anterior");
+        assert(bt_phase1_phrase_text(k_adapter[i]) != NULL); /* a frase existe na tabela */
+        assert(!bt_ui_apply_reply_phrase(&ipc, k_adapter[i]));
+        assert(strcmp(ipc.status_msg, "texto anterior") == 0);
+    }
+
+    printf("[PASS] tarefa 07: frase de adaptador nao substitui o status\n");
+}
+
+static void test_scan_list_reaches_the_screen(void) {
+    hci_inquiry_item_t items[2];
+    memset(items, 0, sizeof items);
+    memcpy(items[0].bd_addr, "\x11\x22\x33\x44\x55\x66", 6);
+    items[0].class_of_device = 0x002508u;
+    memcpy(items[0].name, "Wireless Controller", 20);
+    memcpy(items[1].bd_addr, "\xAA\xBB\xCC\xDD\xEE\xFF", 6);
+    memcpy(items[1].name, "Fone", 4);
+    uint8_t buf[BT_SCAN_FILE_BYTES];
+    assert(bt_scan_pack(buf, sizeof buf, items, 2, true) == BT_SCAN_FILE_BYTES);
+    bt_ipc_state_t ipc;
+    memset(&ipc, 0, sizeof ipc);
+    assert(bt_scan_apply(&ipc, buf, sizeof buf));
+    assert(ipc.scan_active);
+    assert(ipc.scan_count == 2);
+    assert(memcmp(ipc.scan_items[0].bd_addr, items[0].bd_addr, 6) == 0);
+    assert(ipc.scan_items[0].class_of_device == 0x002508u);
+    assert(strcmp(ipc.scan_items[0].name, "Wireless Controller") == 0);
+    assert(strcmp(ipc.scan_items[1].name, "Fone") == 0);
+    printf("[PASS] busca: a lista encontrada chega na tela\n");
+}
+
 int main(void) {
     test_paired_ini_roundtrip();
     test_par05_player_roundtrip();
@@ -295,6 +524,12 @@ int main(void) {
     test_lim01_second_address_refused();
     test_par05_empty_ini_no_reply();
     test_slots_and_ui_ipc();
+    test_dpad_follows_the_screen();
     test_interactive_button_remap();
+    test_first_pairing_requests_pair_and_connect();
+    test_stored_ds4_does_not_offer_pairing();
+    test_reply_phrase_becomes_exact_text();
+    test_adapter_phrase_keeps_status();
+    test_scan_list_reaches_the_screen();
     return 0;
 }
