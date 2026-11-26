@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -63,6 +64,29 @@ static int bridge_submit_control_out(void *ctx, uint8_t bmRequestType, uint8_t b
     }
 
     uint16_t opcode = hci_get_le16(data);
+
+    if (b->hci_fd < 0) {
+        static const uint8_t version[] = { 0, 9, 0x34, 0x12, 9, 0x5d, 0, 0x78, 0x56 };
+        static const uint8_t address[] = { 0, 1, 2, 3, 4, 5, 6 };
+        const uint8_t *params = NULL;
+        size_t params_len = 1;
+        static const uint8_t success[] = { 0 };
+        if (opcode == HCI_OP_RESET) params = success;
+        else if (opcode == HCI_OP_READ_LOCAL_VERSION_INFO) {
+            params = version;
+            params_len = sizeof(version);
+        } else if (opcode == HCI_OP_READ_BD_ADDR) {
+            params = address;
+            params_len = sizeof(address);
+        } else return -1;
+        b->pending_evt[0] = HCI_EVT_COMMAND_COMPLETE;
+        b->pending_evt[1] = (uint8_t)(3 + params_len);
+        b->pending_evt[2] = 1;
+        hci_put_le16(b->pending_evt + 3, opcode);
+        memcpy(b->pending_evt + 5, params, params_len);
+        b->pending_evt_len = 5 + params_len;
+        return 0;
+    }
 
     /*
      * Do NOT send HCI_Reset to the host's live hci0 so we don't disrupt
@@ -169,6 +193,11 @@ static void run_profile_test(int hci_fd, const char *name, uint16_t vid, uint16_
     assert(tr.state == BT_INIT_READY);
     assert(tr.has_local_ver);
     assert(tr.has_bd_addr);
+    if (hci_fd < 0) {
+        static const uint8_t expected_addr[] = { 1, 2, 3, 4, 5, 6 };
+        assert(tr.local_ver.manufacturer == 0x005d);
+        assert(memcmp(tr.bd_addr.bd_addr, expected_addr, sizeof(expected_addr)) == 0);
+    }
 
     printf("[PASS] %-30s (VID:PID %04X:%04X, IntrMPS=%u) -> BT %s | Mfr=0x%04X | BD=%02X:%02X:%02X:%02X:%02X:%02X\n",
            name, vid, pid, intr_mps,
@@ -178,7 +207,7 @@ static void run_profile_test(int hci_fd, const char *name, uint16_t vid, uint16_
            tr.bd_addr.bd_addr[2], tr.bd_addr.bd_addr[1], tr.bd_addr.bd_addr[0]);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     /* Sanity check Xbox 360 HAL struct sizes and endian helper */
     assert(x360_bswap16(0x1234u) == 0x3412u);
     assert(sizeof(x360_usb_device_descriptor_t) == 18u);
@@ -186,33 +215,46 @@ int main(void) {
     assert(sizeof(x360_usb_endpoint_descriptor_t) == 7u);
     assert(sizeof(x360_usb_setup_packet_t) == 8u);
 
-    int fd = socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI);
-    if (fd < 0) {
-        perror("socket(AF_BLUETOOTH, BTPROTO_HCI)");
-        return 1;
+    int fd = -1;
+    if (argc > 3 || (argc >= 2 && strcmp(argv[1], "--live") != 0)) {
+        fprintf(stderr, "Usage: %s [--live [HCI_INDEX]]\n", argv[0]);
+        return 2;
+    }
+    if (argc >= 2) {
+        char *end = NULL;
+        long index = argc == 3 ? strtol(argv[2], &end, 10) : 0;
+        if (argc == 3 && (end == argv[2] || *end != '\0' || index < 0 || index > 65534)) {
+            fprintf(stderr, "Invalid HCI index: %s\n", argv[2]);
+            return 2;
+        }
+        fd = socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI);
+        if (fd < 0) {
+            perror("socket(AF_BLUETOOTH, BTPROTO_HCI)");
+            return 1;
+        }
+
+        struct timeval tv = { 2, 0 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        struct sockaddr_hci addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.hci_family  = AF_BLUETOOTH;
+        addr.hci_dev     = (unsigned short)index;
+        addr.hci_channel = HCI_CHANNEL_RAW;
+
+        if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            fprintf(stderr, "bind(hci%ld) failed: %s\n", index, strerror(errno));
+            close(fd);
+            return 1;
+        }
     }
 
-    struct timeval tv = { 2, 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    struct sockaddr_hci addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.hci_family  = AF_BLUETOOTH;
-    addr.hci_dev     = 0;
-    addr.hci_channel = HCI_CHANNEL_RAW;
-
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "bind(hci0) failed: %s\n", strerror(errno));
-        close(fd);
-        return 1;
-    }
-
-    /* Real hardware UGREEN dongle + published USB Bluetooth dongle profiles */
-    run_profile_test(fd, "UGREEN RTL8761BU (Real USB)",  0x2B89, 0x8761, 16);
+    /* Device profiles use simulated responses by default; --live uses hci0. */
+    run_profile_test(fd, "UGREEN RTL8761BU profile",     0x2B89, 0x8761, 16);
     run_profile_test(fd, "CSR8510 A10 (Generic)",       0x0A12, 0x0001, 16);
     run_profile_test(fd, "UGREEN CM748 (Barrot)",       0x33FA, 0x0010, 16);
     run_profile_test(fd, "UGREEN BT 5.0 (RTL8761B)",    0x0BDA, 0x8771, 8);
 
-    close(fd);
+    if (fd >= 0) close(fd);
     return 0;
 }
