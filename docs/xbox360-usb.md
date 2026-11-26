@@ -13,6 +13,27 @@ Este documento consolida os achados da **Fase 1** e **Fase 2**, detalhando como 
 
 ## 2. Pilha USB do Kernel (`Usbd` em `xboxkrnl.exe`)
 
+### Evidência do console retail 17559
+
+A captura BTU1 do console retornou as 24 páginas previstas. A análise
+identificou o contrato parcial abaixo. Os binários da captura ficam fora do Git.
+
+| Operação | Evidência no 17559 |
+| :--- | :--- |
+| Registrar e remover | Os ordinais 755 e 756 recebem o ponteiro do objeto em `r3`. A rotina interna insere ou remove o objeto da lista usando os campos de ligação em `+0x00` e `+0x04`. |
+| Selecionar driver | A rotina em `0x800D6178` chama o callback em `+0x14` com o descritor candidato, o descritor de dispositivo e o próprio objeto. Um retorno diferente de zero seleciona o objeto. |
+| Associar dispositivo | Em `0x800D6F98`, o kernel grava o objeto selecionado em `handle + 0x04` e chama o callback em `objeto + 0x0C` com o handle. |
+| Remover dispositivo | O despacho em `0x800D66C8` e `0x800D6764` chama o callback em `+0x10`. O caminho também pode chamar o callback opcional em `+0x18`. |
+| Transferir | As exportações de abertura e fila encaminham para rotinas diferentes conforme o controlador USB. A captura cobre ambos os caminhos e permite conferir o layout do TRB. |
+
+O build experimental registra um objeto com esses callbacks e com a extensão
+opcional nula. O filtro de seleção aceita apenas o UGREEN `2B89:8761`, com
+classe HCI na interface zero. A sequência tenta configurar o USB, receber
+eventos HCI e completar Reset, Read Local Version e Read BD_ADDR. Na remoção,
+fecha o endpoint de interrupção e então o endpoint padrão antes de notificar o
+kernel. A associação, a ordem das conclusões e a remoção ainda precisam ser
+validadas em hardware.
+
 Diferente do modelo WDM/WDF do Windows NT, o kernel do Xbox 360 implementa uma pilha USB compacta e integrada dentro do próprio `xboxkrnl.exe` chamada **`Usbd`**.
 
 ### Exportações Relevantes (`xboxkrnl.exe` — `kernelext21250.0.def`)
