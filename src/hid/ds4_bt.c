@@ -154,7 +154,33 @@ int ds4_bt_parse_hidp_mapped(const uint8_t *hidp, size_t len,
     out_state->buttons       = btns;
     out_state->left_trigger  = map->swap_triggers ? gp[8] : gp[7];
     out_state->right_trigger = map->swap_triggers ? gp[7] : gp[8];
+    /* O analógico vem em zero em alguns quadros; o bit digital ainda é o gatilho. */
+    if (out_state->left_trigger == 0 && (b1 & 0x04u)) out_state->left_trigger = 255u;
+    if (out_state->right_trigger == 0 && (b1 & 0x08u)) out_state->right_trigger = 255u;
     return 0;
+}
+
+static uint32_t crc32_ieee(const uint8_t *data, size_t len) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++)
+            crc = (crc & 1u) ? (crc >> 1) ^ 0xEDB88320u : crc >> 1;
+    }
+    return ~crc;
+}
+
+void ds4_bt_seal_output(uint8_t *report) {
+    uint8_t covered[75];
+    uint32_t crc;
+    if (!report) return;
+    covered[0] = 0xA2u;
+    memcpy(covered + 1, report + 1, 74u);
+    crc = crc32_ieee(covered, sizeof covered);
+    report[75] = (uint8_t)crc;
+    report[76] = (uint8_t)(crc >> 8);
+    report[77] = (uint8_t)(crc >> 16);
+    report[78] = (uint8_t)(crc >> 24);
 }
 
 size_t ds4_bt_build_rumble_report(uint8_t *out, size_t out_len,
@@ -170,6 +196,7 @@ size_t ds4_bt_build_rumble_report(uint8_t *out, size_t out_len,
     out[4] = 0x07u; /* habilita rumble/LED */
     out[7] = small_motor;
     out[8] = large_motor;
+    ds4_bt_seal_output(out);
     return DS4_BT_OUTPUT_REPORT_LEN;
 }
 
