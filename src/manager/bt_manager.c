@@ -1,5 +1,6 @@
 #include "bt_manager.h"
 #include "../hid/ds4_bt.h"
+#include "bt_phase1.h"
 #include <string.h>
 
 void bt_ipc_init(bt_ipc_state_t *ipc) {
@@ -66,22 +67,81 @@ int bt_manager_forget_paired(bt_ipc_state_t *ipc, const uint8_t bd_addr[6]) {
     return -2;
 }
 
+int bt_manager_paired_count(const bt_ipc_state_t *ipc) {
+    int n = 0;
+    if (!ipc) return 0;
+    for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
+        if (ipc->paired[i].valid) n++;
+    }
+    return n;
+}
+
+static uint8_t free_player_except(const bt_ipc_state_t *ipc, uint8_t avoid) {
+    for (uint8_t p = 1u; p <= 4u; p++) {
+        if (p == avoid) continue;
+        bool used = false;
+        for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
+            if (ipc->paired[i].valid && ipc->paired[i].player == p) used = true;
+        }
+        if (!used) return p;
+    }
+    return 0u;
+}
+
 int bt_manager_store_single_ds4(bt_ipc_state_t *ipc, const uint8_t bd_addr[6],
                                 const uint8_t link_key[16], uint8_t key_type,
                                 uint8_t player, const char *name) {
-    if (!ipc || !bd_addr || !link_key || player < 1u || player > 2u) return -1;
+    if (!ipc || !bd_addr || !link_key || player < 1u || player > 4u) return -1;
 
-    /* LIM-01: um unico DualShock 4; outro endereco gravado recusa a escrita. */
+    int others = 0;
+    int self = -1;
+    uint8_t previous = 0u;
     for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
-        if (ipc->paired[i].valid && memcmp(ipc->paired[i].bd_addr, bd_addr, 6u) != 0) {
-            return -3;
+        if (!ipc->paired[i].valid) continue;
+        if (memcmp(ipc->paired[i].bd_addr, bd_addr, 6u) == 0) {
+            self = (int)i;
+            previous = ipc->paired[i].player;
+        } else {
+            others++;
         }
+    }
+    if (self < 0 && others >= 4) return -3;
+
+    for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
+        if (!ipc->paired[i].valid || memcmp(ipc->paired[i].bd_addr, bd_addr, 6u) == 0) continue;
+        if (ipc->paired[i].player != player) continue;
+        ipc->paired[i].player = (previous >= 1u && previous <= 4u && previous != player)
+                                    ? previous
+                                    : free_player_except(ipc, player);
+        break;
     }
 
     int idx = bt_manager_upsert_paired(ipc, bd_addr, link_key, key_type, 0x002508u, name);
     if (idx < 0) return idx;
     ipc->paired[idx].player = player;
     return idx;
+}
+
+int bt_manager_set_player(bt_ipc_state_t *ipc, const uint8_t bd_addr[6], uint8_t player) {
+    if (!ipc || !bd_addr || player < 1u || player > 4u) return -1;
+    int self = -1;
+    for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
+        if (ipc->paired[i].valid && memcmp(ipc->paired[i].bd_addr, bd_addr, 6u) == 0) {
+            self = (int)i;
+            break;
+        }
+    }
+    if (self < 0) return -1;
+    const uint8_t previous = ipc->paired[self].player;
+    if (previous == player) return self;
+    for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
+        if ((int)i == self || !ipc->paired[i].valid) continue;
+        if (ipc->paired[i].player != player) continue;
+        ipc->paired[i].player = (previous >= 1u && previous <= 4u) ? previous : 0u;
+        break;
+    }
+    ipc->paired[self].player = player;
+    return self;
 }
 
 size_t bt_manager_build_link_key_reply(const bt_ipc_state_t *ipc, const uint8_t bd_addr[6],
@@ -189,8 +249,8 @@ size_t bt_manager_export_ini(const bt_ipc_state_t *ipc, char *out_buf, size_t ca
         pos = append_str(out_buf, cap, pos, d->name[0] ? d->name : "Controller");
         pos = append_str(out_buf, cap, pos, "\n");
 
-        /* Format: player=<BD_ADDR_12HEX>,<PLAYER_2HEX>\n (somente com jogador 1 ou 2) */
-        if (d->player >= 1u && d->player <= 2u) {
+        /* Format: player=<BD_ADDR_12HEX>,<PLAYER_2HEX>\n (jogador 1..4) */
+        if (d->player >= 1u && d->player <= 4u) {
             pos = append_str(out_buf, cap, pos, "player=");
             pos = append_hex_bytes(out_buf, cap, pos, d->bd_addr, 6u, true);
             pos = append_str(out_buf, cap, pos, ",");
@@ -241,23 +301,17 @@ int bt_manager_import_ini(bt_ipc_state_t *ipc, const char *ini_text, size_t len)
                 if (nlen >= sizeof(name)) nlen = sizeof(name) - 1u;
                 memcpy(name, line + 53u, nlen);
                 name[nlen] = '\0';
-                /* LIM-01: um segundo endereco no arquivo e ignorado. */
-                bool other_stored = false;
-                for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
-                    if (ipc->paired[i].valid && memcmp(ipc->paired[i].bd_addr, bd, 6u) != 0) {
-                        other_stored = true;
-                        break;
-                    }
-                }
-                if (!other_stored &&
-                    bt_manager_upsert_paired(ipc, bd, lk, kt, 0x002508u, name) >= 0) {
+                if (bt_manager_paired_count(ipc) >= 4 &&
+                    bt_manager_find_paired(ipc, bd) == NULL) {
+                    /* Quatro enderecos ja ocupam a lista. */
+                } else if (bt_manager_upsert_paired(ipc, bd, lk, kt, 0x002508u, name) >= 0) {
                     loaded++;
                 }
             }
         } else if (line_len >= 22u && memcmp(line, "player=", 7u) == 0 && line[19] == ',') {
             uint8_t bd[6], pl = 0;
             if (parse_hex_seq(line + 7u, bd, 6u, true) &&
-                parse_hex_seq(line + 20u, &pl, 1u, false) && pl >= 1u && pl <= 2u) {
+                parse_hex_seq(line + 20u, &pl, 1u, false) && pl >= 1u && pl <= 4u) {
                 for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
                     if (ipc->paired[i].valid && memcmp(ipc->paired[i].bd_addr, bd, 6u) == 0) {
                         ipc->paired[i].player = pl;
@@ -268,6 +322,50 @@ int bt_manager_import_ini(bt_ipc_state_t *ipc, const char *ini_text, size_t len)
         }
     }
     return loaded;
+}
+
+size_t bt_scan_pack(uint8_t *dst, size_t cap, const hci_inquiry_item_t *items,
+                    uint32_t count, bool scanning) {
+    if (!dst || cap < BT_SCAN_FILE_BYTES) return 0;
+    if (!items) count = 0;
+    if (count > BT_MAX_SCAN_ITEMS) count = BT_MAX_SCAN_ITEMS;
+    memset(dst, 0, BT_SCAN_FILE_BYTES);
+    const uint32_t magic = BT_SCAN_FILE_MAGIC;
+    const uint32_t active = scanning ? 1u : 0u;
+    memcpy(dst + 0, &magic, 4u);
+    memcpy(dst + 4, &count, 4u);
+    memcpy(dst + 8, &active, 4u);
+    for (uint32_t i = 0; i < count; i++) {
+        uint8_t *p = dst + 16u + (size_t)i * 44u;
+        memcpy(p, items[i].bd_addr, 6u);
+        memcpy(p + 8, &items[i].class_of_device, 4u);
+        memcpy(p + 12, items[i].name, 32u);
+        p[43] = 0;
+    }
+    return BT_SCAN_FILE_BYTES;
+}
+
+bool bt_scan_apply(bt_ipc_state_t *ipc, const uint8_t *src, size_t len) {
+    if (!ipc || !src || len < 16u) return false;
+    uint32_t magic = 0, count = 0, scanning = 0;
+    memcpy(&magic, src + 0, 4u);
+    memcpy(&count, src + 4, 4u);
+    memcpy(&scanning, src + 8, 4u);
+    if (magic != BT_SCAN_FILE_MAGIC) return false;
+    if (count > BT_MAX_SCAN_ITEMS) count = BT_MAX_SCAN_ITEMS;
+    if (len < 16u + (size_t)count * 44u) return false;
+    memset(ipc->scan_items, 0, sizeof ipc->scan_items);
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *p = src + 16u + (size_t)i * 44u;
+        hci_inquiry_item_t *dst = &ipc->scan_items[i];
+        memcpy(dst->bd_addr, p, 6u);
+        memcpy(&dst->class_of_device, p + 8, 4u);
+        memcpy(dst->name, p + 12, 31u);
+        dst->name[31] = '\0';
+    }
+    ipc->scan_count = count;
+    ipc->scan_active = scanning != 0;
+    return true;
 }
 
 void bt_ipc_issue_cmd(bt_ipc_state_t *ipc, bt_ipc_cmd_t cmd,
@@ -306,11 +404,71 @@ static const bt_paired_device_t *paired_at(const bt_ipc_state_t *ipc, int idx) {
     return NULL;
 }
 
+bool bt_manager_has_stored_ds4(const bt_ipc_state_t *ipc) {
+    if (!ipc) return false;
+    for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
+        if (ipc->paired[i].valid) return true;
+    }
+    return false;
+}
+
+bool bt_ui_apply_reply_phrase(bt_ipc_state_t *ipc, uint32_t phrase_id) {
+    if (!ipc) return false;
+    if (phrase_id < BT_PHRASE_DS4_PAIRED_PLAYER1 || phrase_id > BT_PHRASE_DS4_DISCONNECTED)
+        return false;
+    const char *text = bt_phase1_phrase_text(phrase_id);
+    if (!text) return false;
+    size_t n = 0;
+    while (text[n]) n++;
+    if (n >= sizeof(ipc->status_msg)) return false; /* nunca truncar a frase da tabela */
+    memcpy(ipc->status_msg, text, n + 1u);
+    return true;
+}
+
 void bt_ui_model_init(bt_ui_model_t *m) {
     if (!m) return;
     m->pane = BT_UI_PANE_SCAN;
     m->cursor = 0;
+    m->content_focused = false;
     m->exit_requested = false;
+    m->identify_mode = false;
+}
+
+static void move_pane(bt_ui_model_t *m, int delta) {
+    int pane = (int)m->pane + delta;
+    if (pane < (int)BT_UI_PANE_SLOTS || pane > (int)BT_UI_PANE_SCAN) return;
+    m->pane = (bt_ui_pane_t)pane;
+    m->cursor = 0;
+}
+
+/* Menu à esquerda é uma coluna. Controles é uma grade 2x2. Listas são uma coluna. */
+static void move_focus(bt_ui_model_t *m, const bt_ipc_state_t *ipc, uint16_t btns) {
+    if (!m->content_focused) {
+        if (btns & X360_BTN_DPAD_UP) move_pane(m, -1);
+        if (btns & X360_BTN_DPAD_DOWN) move_pane(m, 1);
+        if (btns & X360_BTN_DPAD_RIGHT) {
+            m->content_focused = true;
+            m->cursor = 0;
+        }
+        return;
+    }
+
+    int count = pane_item_count(ipc, m->pane);
+    if (m->pane == BT_UI_PANE_SLOTS) {
+        if ((btns & X360_BTN_DPAD_UP) && m->cursor >= 2) m->cursor -= 2;
+        if ((btns & X360_BTN_DPAD_DOWN) && m->cursor + 2 < count) m->cursor += 2;
+        if (btns & X360_BTN_DPAD_LEFT) {
+            if (m->cursor % 2 == 1) m->cursor -= 1;
+            else m->content_focused = false;
+        }
+        if ((btns & X360_BTN_DPAD_RIGHT) && (m->cursor % 2) == 0 && m->cursor + 1 < count)
+            m->cursor += 1;
+        return;
+    }
+
+    if ((btns & X360_BTN_DPAD_UP) && m->cursor > 0) m->cursor--;
+    if ((btns & X360_BTN_DPAD_DOWN) && m->cursor + 1 < count) m->cursor++;
+    if (btns & X360_BTN_DPAD_LEFT) m->content_focused = false;
 }
 
 void bt_ui_handle_input(bt_ui_model_t *m, bt_ipc_state_t *ipc, uint16_t btns) {
@@ -320,35 +478,37 @@ void bt_ui_handle_input(bt_ui_model_t *m, bt_ipc_state_t *ipc, uint16_t btns) {
         m->exit_requested = true;
         return;
     }
-    if (btns & X360_BTN_DPAD_LEFT) {
-        if (m->pane > BT_UI_PANE_SLOTS) {
-            m->pane = (bt_ui_pane_t)(m->pane - 1);
-            m->cursor = 0;
-        }
-    }
-    if (btns & X360_BTN_DPAD_RIGHT) {
-        if (m->pane < BT_UI_PANE_SCAN) {
-            m->pane = (bt_ui_pane_t)(m->pane + 1);
-            m->cursor = 0;
-        }
-    }
-
-    int max_items = pane_item_count(ipc, m->pane);
-    if (btns & X360_BTN_DPAD_UP) {
-        if (m->cursor > 0) m->cursor--;
-    }
-    if (btns & X360_BTN_DPAD_DOWN) {
-        if (m->cursor + 1 < max_items) m->cursor++;
-    }
+    move_focus(m, ipc, btns);
 
     if (btns & X360_BTN_Y) {
         bt_ipc_issue_cmd(ipc, ipc->scan_active ? BT_IPC_CMD_STOP_SCAN : BT_IPC_CMD_START_SCAN,
                          NULL, 0);
     }
-    if (btns & X360_BTN_A) {
-        if (m->pane == BT_UI_PANE_SCAN && (uint32_t)m->cursor < ipc->scan_count) {
-            bt_ipc_issue_cmd(ipc, BT_IPC_CMD_PAIR_AND_CONNECT,
-                             ipc->scan_items[m->cursor].bd_addr, 0);
+    if ((btns & X360_BTN_LEFT_SHOULDER) && m->pane == BT_UI_PANE_SLOTS)
+        m->identify_mode = !m->identify_mode;
+    /* Ate quatro controles. A na grade Controles troca o jogador do card focado. */
+    if ((btns & X360_BTN_A) && m->content_focused) {
+        if (m->pane == BT_UI_PANE_SCAN) {
+            if (bt_manager_paired_count(ipc) < 4) {
+                const bool on_item = m->cursor >= 0 && (uint32_t)m->cursor < ipc->scan_count;
+                bt_ipc_issue_cmd(ipc, BT_IPC_CMD_PAIR_AND_CONNECT,
+                                 on_item ? ipc->scan_items[m->cursor].bd_addr : NULL, 0);
+            }
+        } else if (m->pane == BT_UI_PANE_SLOTS && m->cursor >= 0 &&
+                   (uint32_t)m->cursor < BT_MAX_ACTIVE_SLOTS) {
+            const uint8_t here = (uint8_t)(m->cursor + 1);
+            const bt_paired_device_t *owner = NULL;
+            for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
+                if (ipc->paired[i].valid && ipc->paired[i].player == here) {
+                    owner = &ipc->paired[i];
+                    break;
+                }
+            }
+            if (owner) {
+                const uint8_t next = here == 4u ? 1u : (uint8_t)(here + 1u);
+                if (bt_manager_set_player(ipc, owner->bd_addr, next) >= 0)
+                    bt_ipc_issue_cmd(ipc, BT_IPC_CMD_SET_PLAYER, owner->bd_addr, next);
+            }
         } else if (m->pane == BT_UI_PANE_PAIRED) {
             const bt_paired_device_t *pd = paired_at(ipc, m->cursor);
             if (pd) {
@@ -356,9 +516,12 @@ void bt_ui_handle_input(bt_ui_model_t *m, bt_ipc_state_t *ipc, uint16_t btns) {
             }
         }
     }
-    if (btns & X360_BTN_X) {
+    if ((btns & X360_BTN_X) && m->content_focused) {
         if (m->pane == BT_UI_PANE_SLOTS && m->cursor >= 0 &&
-            (uint32_t)m->cursor < BT_MAX_ACTIVE_SLOTS && ipc->slots[m->cursor].connected) {
+            (uint32_t)m->cursor < BT_MAX_ACTIVE_SLOTS &&
+            (ipc->slots[m->cursor].connected ||
+             (ipc->pad_link == BT_LINK_UP &&
+              ipc->live_player == (uint8_t)(m->cursor + 1)))) {
             bt_ipc_issue_cmd(ipc, BT_IPC_CMD_DISCONNECT_SLOT, NULL, (uint32_t)m->cursor);
         } else if (m->pane == BT_UI_PANE_PAIRED) {
             const bt_paired_device_t *pd = paired_at(ipc, m->cursor);
