@@ -96,6 +96,9 @@ int ds4_bt_parse_hidp_mapped(const uint8_t *hidp, size_t len,
 size_t ds4_bt_build_rumble_report(uint8_t *out, size_t out_len,
                                   uint8_t small_motor, uint8_t large_motor);
 
+/* CRC32 do quadro Bluetooth (prefixo 0xA2 + 74 bytes) nos 4 bytes finais. */
+void ds4_bt_seal_output(uint8_t *report);
+
 #ifdef __cplusplus
 }
 #endif
