@@ -25,6 +25,8 @@ typedef enum {
     BT_PHRASE_DS4_ALREADY_PAIRED,
     BT_PHRASE_DS4_PAIR_FAILED,
     BT_PHRASE_DS4_DISCONNECTED,
+    BT_PHRASE_DS4_PAIRED_PLAYER3,
+    BT_PHRASE_DS4_PAIRED_PLAYER4,
 } bt_phase1_phrase_id_t;
 
 typedef enum {
@@ -50,6 +52,8 @@ typedef struct {
     uint32_t                   pair_elapsed_sec;
     const uint8_t             *candidate_bd_addr;
     const uint8_t             *stored_bd_addr;
+    /* 0 mantem a regra antiga (um DS4). 1..3 aceita outro endereco. 4 recusa o quinto. */
+    uint32_t                   paired_count;
 } bt_phase1_context_t;
 
 #define BT_PHASE1_PAIR_TIMEOUT_SEC 60u
