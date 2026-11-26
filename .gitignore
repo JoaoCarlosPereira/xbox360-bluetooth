@@ -15,3 +15,7 @@ src/linux_test/usbdevfs_probe
 src/linux_test/test_l2cap_ds4
 src/linux_test/ds4_live
 src/linux_test/test_manager_ui
+src/linux_test/test_pad_inject
+src/linux_test/test_pair_session
+src/linux_test/test_phase1
+src/linux_test/test_transport_session
