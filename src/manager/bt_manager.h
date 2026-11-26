@@ -16,6 +16,8 @@ extern "C" {
 #define BT_MAX_ACTIVE_SLOTS      4u
 #define BT_MAX_PAIRED_DEVICES    8u
 #define BT_MAX_SCAN_ITEMS        16u
+#define BT_SCAN_FILE_MAGIC       0x42544331u /* "BTC1" */
+#define BT_SCAN_FILE_BYTES       (16u + BT_MAX_SCAN_ITEMS * 44u)
 
 typedef enum {
     BT_IPC_CMD_NONE = 0,
@@ -24,7 +26,8 @@ typedef enum {
     BT_IPC_CMD_PAIR_AND_CONNECT,
     BT_IPC_CMD_CONNECT_PAIRED,
     BT_IPC_CMD_DISCONNECT_SLOT,
-    BT_IPC_CMD_FORGET_PAIRED
+    BT_IPC_CMD_FORGET_PAIRED,
+    BT_IPC_CMD_SET_PLAYER
 } bt_ipc_cmd_t;
 
 typedef struct {
@@ -58,8 +61,15 @@ typedef struct {
     uint32_t           magic;
     uint32_t           version;
 
+#define BT_LINK_DOWN        0u
+#define BT_LINK_CONNECTING  1u
+#define BT_LINK_UP          2u
+
     /* Dongle status */
     bool               dongle_ready;
+    uint8_t            pad_link; /* BT_LINK_*: desconectado, conectando, conectado */
+    uint8_t            live_player;     /* 1..4 do controle com o link aberto; 0 se nenhum */
+    uint8_t            identify_player; /* 1..4 enquanto SHARE esta preso nesse controle */
     uint16_t           dongle_vid;
     uint16_t           dongle_pid;
     uint8_t            hci_version;
@@ -76,6 +86,7 @@ typedef struct {
 
     /* Scan / Inquiry state */
     bool               scan_active;
+    bool               scan_finished_empty; /* busca terminou e nenhum aparelho chegou */
     uint32_t           scan_count;
     hci_inquiry_item_t scan_items[BT_MAX_SCAN_ITEMS];
 
@@ -98,7 +109,9 @@ typedef enum {
 typedef struct {
     bt_ui_pane_t pane;
     int          cursor;
+    bool         content_focused; /* false: menu vertical; true: painel da direita */
     bool         exit_requested;
+    bool         identify_mode; /* LB: SHARE no controle acende o card do jogador */
 } bt_ui_model_t;
 
 void bt_ipc_init(bt_ipc_state_t *ipc);
@@ -111,12 +124,18 @@ const bt_paired_device_t *bt_manager_find_paired(const bt_ipc_state_t *ipc,
                                                  const uint8_t bd_addr[6]);
 int bt_manager_forget_paired(bt_ipc_state_t *ipc, const uint8_t bd_addr[6]);
 
-/* Registro de um unico DualShock 4 (PAR-05 / LIM-01).
- * Retorna indice >= 0 em sucesso; -1 argumento invalido (player fora de 1..2);
- * -3 se ja existe outro endereco gravado (o registro existente e preservado). */
+/* Ate quatro DualShock 4, jogadores 1..4.
+ * Retorna indice >= 0 em sucesso; -1 argumento invalido (player fora de 1..4);
+ * -3 se ja existem quatro enderecos (os registros existentes ficam). */
 int bt_manager_store_single_ds4(bt_ipc_state_t *ipc, const uint8_t bd_addr[6],
                                 const uint8_t link_key[16], uint8_t key_type,
                                 uint8_t player, const char *name);
+
+/* Quantos enderecos validos estao gravados. */
+int bt_manager_paired_count(const bt_ipc_state_t *ipc);
+
+/* Move o endereco para o jogador 1..4. Se outro controle ocupa esse jogador, os dois trocam. */
+int bt_manager_set_player(bt_ipc_state_t *ipc, const uint8_t bd_addr[6], uint8_t player);
 
 /* Resposta positiva de link key (HCI 0x040B) para o endereco gravado.
  * Retorna o tamanho do comando escrito em out_buf, ou 0 se bd_addr nao esta gravado. */
@@ -132,6 +151,19 @@ int bt_manager_find_slot_by_handle(const bt_ipc_state_t *ipc, uint16_t acl_handl
 /* INI serialization/deserialization for Usb:\bt_devices.ini (zero-alloc) */
 size_t bt_manager_export_ini(const bt_ipc_state_t *ipc, char *out_buf, size_t cap);
 int bt_manager_import_ini(bt_ipc_state_t *ipc, const char *ini_text, size_t len);
+
+/* Tarefa 07: existe um DualShock 4 gravado? (nenhum novo pareamento e oferecido se sim) */
+bool bt_manager_has_stored_ds4(const bt_ipc_state_t *ipc);
+
+/* Tarefa 07: copia para status_msg o texto de bt_phase1_phrase_text(phrase_id) quando o id
+ * e uma frase de DualShock 4 do reply do plugin. Retorna false (status_msg intocado) para
+ * BT_PHRASE_NONE, ids desconhecidos e frases de adaptador. */
+bool bt_ui_apply_reply_phrase(bt_ipc_state_t *ipc, uint32_t phrase_id);
+
+/* Lista da busca: arquivo fixo entre o plugin e a tela (o reply de 32 bytes nao cabe). */
+size_t bt_scan_pack(uint8_t *dst, size_t cap, const hci_inquiry_item_t *items,
+                    uint32_t count, bool scanning);
+bool bt_scan_apply(bt_ipc_state_t *ipc, const uint8_t *src, size_t len);
 
 /* UI navigation & command dispatch */
 void bt_ui_model_init(bt_ui_model_t *m);
