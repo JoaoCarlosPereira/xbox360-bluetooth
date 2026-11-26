@@ -1,7 +1,40 @@
 #ifndef XBOX360_USBD_HAL_H
 #define XBOX360_USBD_HAL_H
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+
+enum {
+    BT_USB_STAGE_WAITING = 0,
+    BT_USB_STAGE_CONFIGURING,
+    BT_USB_STAGE_HCI,
+    BT_USB_STAGE_RESPONDED,
+    BT_USB_STAGE_READY,
+    BT_USB_STAGE_ERROR,
+    BT_USB_STAGE_REMOVING
+};
+
+int x360_usbd_resolve_ordinals(void);
+/* After Aurora is the running title: stop the host controllers, register, and
+ * re-enter USBD. No disk access in that window. Returns 0, 1 when the leftover
+ * page was not freed, or a negative code when the 17559 prologue does not match. */
+int x360_usbd_enumerate_ugreen(void);
+uint32_t x360_usbd_adapter_status(void);
+void x360_usbd_log_changes(void);
+/* Wireless-class HCI interface seen with a VID/PID other than the UGREEN (refused). */
+uint32_t x360_usbd_wrong_adapter_hits(void);
+/* True after the UGREEN was removed, until it is added again. */
+bool x360_usbd_adapter_removed(void);
+/* Solta o controle se um comando longo nao completou. O callback tardio so zera de novo. */
+void x360_usbd_release_control(void);
+
+typedef void (*x360_acl_rx_fn)(const uint8_t *data, size_t len);
+void x360_usbd_set_acl_rx(x360_acl_rx_fn fn);
+/* Pacote HCI ACL completo (cabecalho de 4 bytes + carga). 0 se entrou na fila USB. */
+int x360_usbd_acl_tx(const uint8_t *data, uint16_t len);
+/* Fio do plugin. A conclusao USB so guarda o pacote. */
+void x360_usbd_service(void);
 
 #ifdef __cplusplus
 extern "C" {
