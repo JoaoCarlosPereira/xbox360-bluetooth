@@ -12,13 +12,21 @@ extern "C" {
 /* Standard HCI Opcodes (OGF << 10 | OCF) */
 #define HCI_OP_INQUIRY                  0x0401u
 #define HCI_OP_INQUIRY_CANCEL           0x0402u
+#define HCI_OP_REMOTE_NAME_REQUEST      0x0419u
 #define HCI_OP_CREATE_CONNECTION        0x0405u
+#define HCI_OP_DISCONNECT               0x0406u
+#define HCI_OP_CREATE_CONN_CANCEL       0x0408u
+#define HCI_OP_ACCEPT_CONN_REQ          0x0409u
+#define HCI_OP_REJECT_CONN_REQ          0x040Au
 #define HCI_OP_LINK_KEY_REQ_REPLY       0x040Bu
 #define HCI_OP_LINK_KEY_REQ_NEG_REPLY   0x040Cu
+#define HCI_OP_AUTH_REQUESTED           0x0411u
+#define HCI_OP_SET_CONN_ENCRYPT         0x0413u
 #define HCI_OP_IO_CAP_REQ_REPLY         0x042Bu
 #define HCI_OP_USER_CONFIRM_REQ_REPLY   0x042Cu
 #define HCI_OP_SET_EVENT_MASK           0x0C01u
 #define HCI_OP_RESET                    0x0C03u
+#define HCI_OP_WRITE_PAGE_TIMEOUT       0x0C18u
 #define HCI_OP_WRITE_SCAN_ENABLE        0x0C1Au
 #define HCI_OP_WRITE_INQUIRY_MODE       0x0C45u
 #define HCI_OP_WRITE_SIMPLE_PAIRING     0x0C56u
@@ -29,7 +37,11 @@ extern "C" {
 #define HCI_EVT_INQUIRY_COMPLETE        0x01u
 #define HCI_EVT_INQUIRY_RESULT          0x02u
 #define HCI_EVT_CONNECTION_COMPLETE     0x03u
+#define HCI_EVT_CONNECTION_REQUEST      0x04u
 #define HCI_EVT_DISCONNECTION_COMPLETE  0x05u
+#define HCI_EVT_AUTH_COMPLETE           0x06u
+#define HCI_EVT_REMOTE_NAME_REQ_COMPLETE 0x07u
+#define HCI_EVT_ENCRYPTION_CHANGE       0x08u
 #define HCI_EVT_COMMAND_COMPLETE        0x0Eu
 #define HCI_EVT_COMMAND_STATUS          0x0Fu
 #define HCI_EVT_HARDWARE_ERROR          0x10u
