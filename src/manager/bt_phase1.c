@@ -13,6 +13,8 @@ static const char *const k_phrases[] = {
     [BT_PHRASE_DS4_ALREADY_PAIRED]     = "Já existe um DualShock 4 pareado.",
     [BT_PHRASE_DS4_PAIR_FAILED]        = "Falha ao parear o DualShock 4.",
     [BT_PHRASE_DS4_DISCONNECTED]       = "DualShock 4 desconectado.",
+    [BT_PHRASE_DS4_PAIRED_PLAYER3]     = "DualShock 4 pareado no Jogador 3",
+    [BT_PHRASE_DS4_PAIRED_PLAYER4]     = "DualShock 4 pareado no Jogador 4",
 };
 
 static bt_phase1_decision_t decision_no_phrase(void)
@@ -56,6 +58,15 @@ bt_phase1_decision_t bt_phase1_decide(const bt_phase1_context_t *ctx)
         break;
 
     case BT_PHASE1_EV_PAIR_ATTEMPT:
+        /* Ate quatro enderecos. paired_count 0 preserva os testes de um unico DS4. */
+        if (ctx->paired_count >= 1u && ctx->paired_count < 4u &&
+            ctx->candidate_bd_addr && ctx->stored_bd_addr &&
+            memcmp(ctx->candidate_bd_addr, ctx->stored_bd_addr, 6u) != 0) {
+            out.accept_pair = true;
+            out.player = 0u;
+            out.phrase_id = BT_PHRASE_NONE;
+            break;
+        }
         if (reject_second_ds4_pair(ctx)) {
             out.phrase_id = BT_PHRASE_DS4_ALREADY_PAIRED;
             out.player = 0u;
