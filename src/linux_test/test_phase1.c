@@ -267,7 +267,11 @@ static void test_err_03_ds4_disconnect(void)
 static void test_phrase_bounds_and_null_decide(void)
 {
     assert(bt_phase1_phrase_text(BT_PHRASE_NONE) == NULL);
-    assert(bt_phase1_phrase_text((uint32_t)BT_PHRASE_DS4_DISCONNECTED + 1u) == NULL);
+    assert(strcmp(bt_phase1_phrase_text(BT_PHRASE_DS4_PAIRED_PLAYER3),
+                  "DualShock 4 pareado no Jogador 3") == 0);
+    assert(strcmp(bt_phase1_phrase_text(BT_PHRASE_DS4_PAIRED_PLAYER4),
+                  "DualShock 4 pareado no Jogador 4") == 0);
+    assert(bt_phase1_phrase_text((uint32_t)BT_PHRASE_DS4_PAIRED_PLAYER4 + 1u) == NULL);
     assert(bt_phase1_phrase_text(0xFFFFFFFFu) == NULL);
 
     bt_phase1_decision_t d = bt_phase1_decide(NULL);
