@@ -69,6 +69,24 @@ typedef enum {
 
 #define BT_MAX_DISCOVERED_DEVICES 16u
 
+/* Fila de comandos HCI: um comando em voo por vez (fluxo do controlador). */
+#define BT_USB_CMD_QUEUE_DEPTH    16u
+#define BT_USB_CMD_TIMEOUT_MS     3000u
+/* Fila de eventos HCI para a thread do plugin (produtor: DPC USB). */
+#define BT_USB_EVT_FIFO_DEPTH     16u
+
+typedef struct {
+    uint32_t ready;               /* acessado com __atomic: 1 = slot preenchido */
+    uint16_t opcode;
+    uint8_t  len;
+    uint8_t  params[255];
+} bt_usb_cmd_slot_t;
+
+typedef struct {
+    uint16_t len;
+    uint8_t  data[HCI_MAX_EVT_SIZE];
+} bt_usb_evt_slot_t;
+
 typedef struct {
     bt_usb_device_info_t     dev;
     bt_usb_hal_ops_t         hal;
@@ -92,6 +110,43 @@ typedef struct {
     uint8_t                  scan_duration;
     hci_inquiry_item_t       scan_results[BT_MAX_DISCOVERED_DEVICES];
     size_t                   scan_count;
+    uint8_t                  name_asked[BT_MAX_DISCOVERED_DEVICES];
+    uint8_t                  name_inflight;
+    uint8_t                  name_hold;
+    uint8_t                  name_tries;
+    uint16_t                 name_wait_ms;
+
+    /*
+     * Envio de comandos (qualquer contexto: DPC ou thread do plugin).
+     * Fila multi-produtor sem lock; tx_busy da a posse do canal HCI a quem envia.
+     */
+    bt_usb_cmd_slot_t        cmd_slots[BT_USB_CMD_QUEUE_DEPTH];
+    uint32_t                 cmd_head;       /* so o dono de tx_busy avanca */
+    uint32_t                 cmd_tail;       /* reservado por produtores (CAS) */
+    uint32_t                 tx_busy;
+    uint32_t                 cmd_inflight;   /* 1 ate Command Complete/Status do opcode */
+    uint16_t                 inflight_opcode;
+    uint32_t                 inflight_age_ms;
+    uint32_t                 cmd_timeouts;
+    bool                     intr_armed;
+    /* Ultimo comando enviado e ultimo evento HCI. A thread do plugin so le. */
+    uint32_t                 trace_opcode;
+    uint32_t                 trace_evt;
+    uint32_t                 trace_events;
+    /* Ultimo Command Complete/Status, gravado no DPC. A thread le cc_seq. */
+    uint32_t                 cc_opcode;
+    uint32_t                 cc_status;
+    uint32_t                 cc_param;
+    uint8_t                  cc_data[12];
+    uint8_t                  cc_len;
+    uint32_t                 cc_seq;
+
+    /* Eventos para a thread do plugin: SPSC (DPC produz, thread consome). */
+    bt_usb_evt_slot_t        evt_fifo[BT_USB_EVT_FIFO_DEPTH];
+    uint32_t                 evt_head;       /* consumidor */
+    uint32_t                 evt_tail;       /* produtor */
+    uint32_t                 evt_dropped;
+    uint32_t                 events_enabled;
 } bt_usb_transport_t;
 
 /**
@@ -130,6 +185,41 @@ int bt_usb_transport_start_inquiry(bt_usb_transport_t *tr, uint8_t duration_1280
  * Cancel an active inquiry scan.
  */
 int bt_usb_transport_stop_inquiry(bt_usb_transport_t *tr);
+
+/**
+ * Enfileira um comando HCI (qualquer contexto). So um comando fica em voo; o proximo
+ * sai quando chega o Command Complete/Status do anterior (ou apos BT_USB_CMD_TIMEOUT_MS
+ * contados por bt_usb_transport_pump). Retorna 0 se aceito, -1 argumento invalido ou
+ * fila cheia, ou o erro do HAL se este comando foi enviado agora e falhou (descartado).
+ */
+int bt_usb_transport_send_command(bt_usb_transport_t *tr, uint16_t opcode,
+                                  const uint8_t *params, uint8_t param_len);
+
+/**
+ * Chamar periodicamente da thread do plugin com o tempo decorrido: expira comando sem
+ * resposta e reenvia o que estiver na fila.
+ */
+void bt_usb_transport_pump(bt_usb_transport_t *tr, uint32_t elapsed_ms);
+
+/**
+ * Liga/desliga a copia dos eventos HCI para a fila lida por bt_usb_transport_pop_event.
+ */
+void bt_usb_transport_enable_events(bt_usb_transport_t *tr, bool enable);
+
+/**
+ * Retira o proximo evento HCI (codigo, tamanho, parametros). Retorna o tamanho copiado
+ * para out, 0 se nao ha evento, ou -1 se out_cap e pequeno (evento permanece na fila).
+ */
+int bt_usb_transport_pop_event(bt_usb_transport_t *tr, uint8_t *out, size_t out_cap);
+
+/** Eventos descartados por fila cheia. */
+uint32_t bt_usb_transport_events_dropped(const bt_usb_transport_t *tr);
+
+/**
+ * Ultimo transporte inicializado por bt_usb_transport_init (um unico adaptador).
+ * O HAL do Xbox mantem o transporte em armazenamento estatico; o plugin o alcanca por aqui.
+ */
+bt_usb_transport_t *bt_usb_transport_active(void);
 
 #ifdef __cplusplus
 }
