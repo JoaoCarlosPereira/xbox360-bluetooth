@@ -4,6 +4,7 @@ project(bt360_proto C)
 add_library(bt360_proto OBJECT
     plugin_main.c
     rtl_boot.c
+    ../chipset/bt_chipset.c
     ../chipset/rtl8761b.c
     ../manager/console_mailbox.c
     ../manager/bt_trace.c
