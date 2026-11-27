@@ -189,6 +189,13 @@ int bt_manager_set_player(bt_ipc_state_t *ipc, const uint8_t bd_addr[6], uint8_t
     return self;
 }
 
+uint8_t bt_player_for_bound_user(bool official_on_player1, uint8_t xam_user, uint8_t other_user) {
+    if (xam_user > 3u) return 0u;
+    if (official_on_player1 && xam_user == 0u) return 0u;
+    if (other_user <= 3u && xam_user == other_user) return 0u;
+    return (uint8_t)(xam_user + 1u);
+}
+
 size_t bt_manager_build_link_key_reply(const bt_ipc_state_t *ipc, const uint8_t bd_addr[6],
                                        uint8_t *out_buf, size_t out_cap) {
     const bt_paired_device_t *d = bt_manager_find_paired(ipc, bd_addr);
