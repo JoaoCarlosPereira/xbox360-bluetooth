@@ -55,7 +55,7 @@ static void sleep_ms(uint32_t ms) {
 
 /* A faixa é do XNotify, numa thread curta de título. O arquivo fica só como cópia.
  * A thread que pagina o controle não chama o XAM. */
-#define ADAPTER_NOT_FOUND_TICKS  150u /* 15 s of 100 ms polls without the UGREEN */
+#define ADAPTER_NOT_FOUND_TICKS  150u /* 15 s of 100 ms polls without a Bluetooth adapter */
 #define AURORA_SETTLE_TICKS      150u /* 15 s with Aurora as the running title */
 #define NOTICE_FILE "\\Device\\Mass0\\bt360_notice.txt"
 
@@ -622,16 +622,6 @@ extern uint32_t bt360_trampolines[];
 #define g_trampolines bt360_trampolines
 _Static_assert(HOOK_COUNT * PPC_DETOUR_TRAMPOLINE_WORDS * 4u == 680u, "trampoline buffer size");
 
-/* A tela de perfil só lê o jogador 1. O oficial fica nessa leitura e cada DS4 soma. */
-static uint32_t g_player1_context;
-static x360_gamepad_state_t g_swap_last;
-
-static void bump_packet(uint32_t *packet, x360_gamepad_state_t *last, const x360_gamepad_state_t *now) {
-    if (!packet || memcmp(last, now, sizeof *now) == 0) return;
-    *last = *now;
-    *packet += 1u;
-}
-
 static uint32_t hook_read_state(uint32_t context, uint32_t *packet, INPUT_GAMEPAD *gamepad,
                                 uint32_t *unk) {
     const bool is0 = g_pad_device_context != 0u && context == g_pad_device_context;
@@ -643,31 +633,8 @@ static uint32_t hook_read_state(uint32_t context, uint32_t *packet, INPUT_GAMEPA
         : x360_pad_inject_filter_read_state(&g_pad, is0, status, packet,
                                             (x360_gamepad_state_t *)gamepad);
     if (result == X360_PAD_ERROR_SUCCESS && status != X360_PAD_ERROR_SUCCESS && unk) *unk = 0u;
-    /* A tela de perfil só lê o jogador 1. O controle original permanece nessa
-     * leitura; cada DualShock ligado soma os botões dele, sem tomar o lugar. */
-    if (!gamepad || is0 || is1 || context == 0u) return result;
-    if (g_player1_context == 0u || context < g_player1_context) g_player1_context = context;
-    if (context != g_player1_context) return result;
-    {
-        const bool official = status == X360_PAD_ERROR_SUCCESS;
-        x360_gamepad_state_t shown = *(x360_gamepad_state_t *)gamepad;
-        bool keep = official;
-        const x360_pad_snapshot_t first = x360_pad_inject_snapshot(&g_pad);
-        const x360_pad_snapshot_t second = x360_pad_inject_snapshot(&g_pad2);
-        if (g_pad_bound && first.active) {
-            x360_pad_overlay_player1(&shown, &first.state, keep);
-            keep = true;
-        }
-        if (g_pad2_bound && second.active) {
-            x360_pad_overlay_player1(&shown, &second.state, keep);
-            keep = true;
-        }
-        if (!keep) return result;
-        *(x360_gamepad_state_t *)gamepad = shown;
-        bump_packet(packet, &g_swap_last, &shown);
-        if (!official && unk) *unk = 0u;
-        return X360_PAD_ERROR_SUCCESS;
-    }
+    /* Cada controle responde apenas ao seu próprio contexto XAM (sem somar no jogador 1). */
+    return result;
 }
 
 static uint32_t hook_capabilities(uint32_t unk, uint32_t user, uint32_t flags, x360_pad_caps_t *caps) {
@@ -879,8 +846,6 @@ static void pad_unbind(void) {
     g_guide_was_down = false;
     g_guide_latched = false;
     g_guide_last_ms = 0u;
-    g_player1_context = 0u;
-    memset(&g_swap_last, 0, sizeof g_swap_last);
 }
 
 /* O jogador é o usuário que o XAM entregou. O usuário 0 fica com o controle oficial. */
@@ -1184,6 +1149,18 @@ static void pair_session_service(uint32_t stage, uint32_t *ready_ms, bool *sessi
     ini_poll(); /* bt_devices.ini is read as soon as the volume answers, adapter or not */
 
     if (!tr) {
+        /* Pump durante HCI/RESPONDED permite retry de HCI_Reset em dongles lentos. */
+        if (stage == BT_USB_STAGE_HCI || stage == BT_USB_STAGE_RESPONDED) {
+            bt_usb_transport_t *init_tr = bt_usb_transport_active();
+            if (init_tr) {
+                const uint64_t delta = (*last_pump_ms && now > *last_pump_ms)
+                                           ? (now - *last_pump_ms) : LOOP_MS;
+                *last_pump_ms = now;
+                bt_usb_transport_pump(init_tr, delta > 1000u ? 1000u : (uint32_t)delta);
+            }
+        } else {
+            *last_pump_ms = 0;
+        }
         /* RESPONDED durante o reset do firmware nao e desconexao. */
         if (stage == BT_USB_STAGE_WAITING || stage == BT_USB_STAGE_REMOVING ||
             x360_usbd_adapter_removed())
@@ -1223,8 +1200,9 @@ static void pair_session_service(uint32_t stage, uint32_t *ready_ms, bool *sessi
     for (unsigned i = 0; i < BT_USB_EVT_FIFO_DEPTH; i++) {
         const int n = bt_usb_transport_pop_event(tr, g_event, sizeof g_event);
         if (n <= 0) break;
-        log_link_event(g_event, n);
+        /* Responde ao HCI antes de gravar no disco (evita atraso de ~100 ms no auth/encrypt). */
         bt_pair_session_on_event(&g_session, g_event, (size_t)n, now);
+        log_link_event(g_event, n);
     }
     const uint32_t dropped = bt_usb_transport_events_dropped(tr);
     if (dropped != g_events_dropped_logged) {
@@ -1350,7 +1328,7 @@ static bool aurora_bus_reset(int ordinal_rc) {
     }
     if (++stable < AURORA_SETTLE_TICKS) return false;
     xsdk_plugin_log("usb: Aurora is the running title; resetting the bus");
-    const int rc = x360_usbd_enumerate_ugreen();
+    const int rc = x360_usbd_enumerate_adapter();
     done = true;
     xsdk_plugin_log("usb: bus reset after Aurora rc=%d", rc);
     return true;
@@ -1360,9 +1338,12 @@ static bool aurora_bus_reset(int ordinal_rc) {
 static bool adapter_state(int rc, uint32_t stage, uint32_t waiting_ticks,
                           bt_phase1_adapter_state_t *state) {
     if (rc != 0) { *state = BT_PHASE1_ADAPTER_NONE; return true; }
-    if (stage == BT_USB_STAGE_READY) { *state = BT_PHASE1_ADAPTER_READY; return true; }
+    if (stage == BT_USB_STAGE_READY) {
+        *state = rtl_boot_fw_missing() ? BT_PHASE1_ADAPTER_FW_MISSING : BT_PHASE1_ADAPTER_READY;
+        return true;
+    }
     if (x360_usbd_adapter_removed()) { *state = BT_PHASE1_ADAPTER_REMOVED; return true; }
-    if (stage != BT_USB_STAGE_WAITING) return false; /* UGREEN arrived, not ready yet */
+    if (stage != BT_USB_STAGE_WAITING) return false; /* adapter arrived, not ready yet */
     if (x360_usbd_wrong_adapter_hits()) { *state = BT_PHASE1_ADAPTER_WRONG; return true; }
     if (waiting_ticks >= ADAPTER_NOT_FOUND_TICKS) { *state = BT_PHASE1_ADAPTER_NONE; return true; }
     return false;
