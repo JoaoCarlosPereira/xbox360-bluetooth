@@ -1,23 +1,27 @@
 #include "rtl_boot.h"
+#include "../chipset/bt_chipset.h"
 #include "../chipset/rtl8761b.h"
 #include "../hci/hci_core.h"
 #include "../manager/bt_trace.h"
 #include "../hal/xbox360_usbd.h"
 #include <xsdk/kernel.h>
 
-#define FW_CAP 49152u
+#define FW_CAP  65536u
 #define CFG_CAP 1024u
-#define FW_FILE "\\Device\\Mass0\\rtl8761bu_fw.bin"
-#define CFG_FILE "\\Device\\Mass0\\rtl8761bu_config.bin"
+#define USB_FW_DIR_PREFIX  "\\Device\\Mass0\\bt_fw\\"
+#define USB_ROOT_PREFIX    "\\Device\\Mass0\\"
+#define POST_RESET_TICKS   10u /* ~100 ms settle para clones CSR/Barrot/Actions */
 
 enum {
     PHASE_IDLE = 0,
+    PHASE_DELAY,
     PHASE_ROM,
     PHASE_UPLOAD,
     PHASE_SETTLE,
     PHASE_COMMIT,
     PHASE_VER,
     PHASE_DONE,
+    PHASE_FW_MISSING,
     PHASE_FAIL
 };
 
@@ -48,8 +52,12 @@ void rtl_boot_reset(void) {
 }
 
 bool rtl_boot_pending(void) {
-    return phase == PHASE_ROM || phase == PHASE_UPLOAD || phase == PHASE_SETTLE ||
-           phase == PHASE_COMMIT || phase == PHASE_VER;
+    return phase == PHASE_DELAY || phase == PHASE_ROM || phase == PHASE_UPLOAD ||
+           phase == PHASE_SETTLE || phase == PHASE_COMMIT || phase == PHASE_VER;
+}
+
+bool rtl_boot_fw_missing(void) {
+    return phase == PHASE_FW_MISSING;
 }
 
 /* true quando o comando esperado respondeu. status e param so valem nesse caso. */
@@ -64,9 +72,26 @@ static bool command_answered(bt_usb_transport_t *tr, uint8_t *status, uint8_t *p
     return true;
 }
 
+static uint16_t build_path(char *dst, size_t cap, const char *prefix, const char *name) {
+    size_t n = 0;
+    if (!dst || !prefix || !name || cap < 2u) return 0;
+    while (prefix[n] != '\0') {
+        if (n + 1u >= cap) return 0;
+        dst[n] = prefix[n];
+        n++;
+    }
+    for (size_t i = 0; name[i] != '\0'; i++) {
+        if (n + 1u >= cap) return 0;
+        dst[n++] = name[i];
+    }
+    dst[n] = '\0';
+    return (uint16_t)(n + 1u);
+}
+
 static bool read_file(const char *path, uint16_t path_size, uint8_t *dst,
                       uint32_t cap, uint32_t *out_n) {
-    const ANSI_STRING name = { path_size - 1, path_size, path };
+    if (!path || path_size < 2u) return false;
+    const ANSI_STRING name = { (uint16_t)(path_size - 1u), path_size, path };
     const OBJECT_ATTRIBUTES attributes = { .name = &name };
     HANDLE file;
     IO_STATUS_BLOCK io = { 0 };
@@ -78,6 +103,18 @@ static bool read_file(const char *path, uint16_t path_size, uint8_t *dst,
     const bool ok = NT_SUCCESS(status) && io.information > 0 && io.information <= cap;
     if (ok) *out_n = (uint32_t)io.information;
     return NT_SUCCESS(NtClose(file)) && ok;
+}
+
+/* Procura primeiro em Usb:\bt_fw\<nome> e depois na raiz Usb:\<nome> (retrocompativel). */
+static bool read_fw_file(const char *basename, uint8_t *dst, uint32_t cap, uint32_t *out_n) {
+    char path[96];
+    uint16_t sz;
+    if (!basename) return false;
+    sz = build_path(path, sizeof path, USB_FW_DIR_PREFIX, basename);
+    if (sz > 1u && read_file(path, sz, dst, cap, out_n)) return true;
+    sz = build_path(path, sizeof path, USB_ROOT_PREFIX, basename);
+    if (sz > 1u && read_file(path, sz, dst, cap, out_n)) return true;
+    return false;
 }
 
 static int send_chunk(void *ctx, uint16_t opcode, const uint8_t *params, uint8_t param_len) {
@@ -92,23 +129,41 @@ static void fail(const char *why, uint32_t value) {
 
 bool rtl_boot_ready(bt_usb_transport_t *tr) {
     if (!tr || !tr->has_local_ver) return false;
+    if (phase == PHASE_FW_MISSING) return false;
     if (phase == PHASE_FAIL || phase == PHASE_DONE) return true;
-    if (!rtl_needs_firmware(&tr->local_ver)) return true;
 
     if (phase == PHASE_IDLE) {
         const hci_local_version_info_t *v = &tr->local_ver;
-        bt_trace("radio: mfr=%04X lmp=%04X hci=%02X", v->manufacturer, v->lmp_subversion,
-                 v->hci_version);
+        bt_chipset_profile_t profile;
+        bt_chipset_identify(tr->dev.vid, tr->dev.pid, v, &profile);
+        bt_trace("radio: vid=%04X pid=%04X mfr=%04X hci=%02X rev=%04X lmp=%04X chip=%s fw=%u",
+                 tr->dev.vid, tr->dev.pid, v->manufacturer, v->hci_version,
+                 v->hci_revision, v->lmp_subversion, profile.name, (unsigned)profile.needs_fw);
+
+        if (!profile.needs_fw) {
+            if ((profile.quirks & BT_QUIRK_POST_RESET_DELAY) != 0u) {
+                wait_ticks = 0;
+                phase = PHASE_DELAY;
+                return false;
+            }
+            phase = PHASE_DONE;
+            return true;
+        }
+
         if (skip_upload) {
             bt_trace("fw: skip reload lmp=%04X", v->lmp_subversion);
             phase = PHASE_FAIL;
             return true;
         }
-        if (!read_file(FW_FILE, sizeof FW_FILE, fw_mem, FW_CAP, &fw_size)) {
-            fail("file missing", 0);
-            return true;
+        if (!read_fw_file(profile.fw_name, fw_mem, FW_CAP, &fw_size)) {
+            bt_trace("fw: missing %s", profile.fw_name ? profile.fw_name : "(null)");
+            phase = PHASE_FW_MISSING;
+            wait_op = 0;
+            return false;
         }
-        if (!read_file(CFG_FILE, sizeof CFG_FILE, cfg_mem, CFG_CAP, &cfg_size)) cfg_size = 0;
+        if (!profile.cfg_name || !read_fw_file(profile.cfg_name, cfg_mem, CFG_CAP, &cfg_size)) {
+            cfg_size = 0;
+        }
         seen_seq = __atomic_load_n(&tr->cc_seq, __ATOMIC_ACQUIRE);
         if (bt_usb_transport_send_command(tr, RTL_OP_READ_ROM_VERSION, NULL, 0) != 0) {
             fail("rom command", 0);
@@ -118,6 +173,12 @@ bool rtl_boot_ready(bt_usb_transport_t *tr) {
         wait_ticks = 0;
         phase = PHASE_ROM;
         return false;
+    }
+
+    if (phase == PHASE_DELAY) {
+        if (++wait_ticks < POST_RESET_TICKS) return false;
+        phase = PHASE_DONE;
+        return true;
     }
 
     if (phase == PHASE_ROM || phase == PHASE_UPLOAD) {
@@ -203,6 +264,7 @@ bool rtl_boot_ready(bt_usb_transport_t *tr) {
             return false;
         }
         hci_cmd_complete_t cc = {
+            .opcode = HCI_OP_READ_LOCAL_VERSION_INFO,
             .params = tr->cc_data,
             .params_len = tr->cc_len
         };
@@ -214,7 +276,9 @@ bool rtl_boot_ready(bt_usb_transport_t *tr) {
         tr->local_ver = ver;
         tr->has_local_ver = true;
         bt_trace("fw: committed lmp=%04X", ver.lmp_subversion);
-        phase = rtl_needs_firmware(&ver) ? PHASE_FAIL : PHASE_DONE;
+        bt_chipset_profile_t post;
+        bt_chipset_identify(tr->dev.vid, tr->dev.pid, &ver, &post);
+        phase = post.needs_fw ? PHASE_FAIL : PHASE_DONE;
         return true;
     }
     return true;
