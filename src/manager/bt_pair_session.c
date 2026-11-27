@@ -17,6 +17,33 @@ static bool addr_eq(const uint8_t *a, const uint8_t *b) {
     return memcmp(a, b, 6u) == 0;
 }
 
+static bool idle_is(const bt_pair_session_t *s, const uint8_t *addr) {
+    if (!s || !addr) return false;
+    for (int i = 0; i < 2; i++) {
+        if (s->idle_on[i] && addr_eq(s->idle_addr[i], addr)) return true;
+    }
+    return false;
+}
+
+static void idle_remember(bt_pair_session_t *s, const uint8_t *addr) {
+    int free_slot = -1;
+    if (!s || !addr) return;
+    for (int i = 0; i < 2; i++) {
+        if (s->idle_on[i] && addr_eq(s->idle_addr[i], addr)) return;
+        if (!s->idle_on[i] && free_slot < 0) free_slot = i;
+    }
+    if (free_slot < 0) free_slot = 0;
+    memcpy(s->idle_addr[free_slot], addr, 6u);
+    s->idle_on[free_slot] = true;
+}
+
+static void idle_forget(bt_pair_session_t *s, const uint8_t *addr) {
+    if (!s || !addr) return;
+    for (int i = 0; i < 2; i++) {
+        if (s->idle_on[i] && addr_eq(s->idle_addr[i], addr)) s->idle_on[i] = false;
+    }
+}
+
 static void send_cmd(bt_pair_session_t *s, uint16_t opcode, const uint8_t *params, uint8_t len) {
     if (s->ops.send_cmd && s->ops.send_cmd(s->ops.ctx, opcode, params, len) != 0) {
         note(s, "send_cmd failed", opcode);
@@ -92,6 +119,8 @@ static void clear_link(bt_pair_session_t *s) {
     s->encrypted = false;
     s->key_valid = false;
     s->incoming = false;
+    s->used_ms = 0;
+    s->idle_drop = false;
 }
 
 static void second_clear(bt_pair_session_t *s) {
@@ -130,7 +159,7 @@ static void page_second(bt_pair_session_t *s) {
         s->second.state == BT_PAIR_AUTH)
         return;
     other = other_stored(s);
-    if (!other) return;
+    if (!other || idle_is(s, other->bd_addr)) return;
     s->second.active = true;
     s->second.incoming = false;
     s->second.established = false;
@@ -161,7 +190,9 @@ static void begin_held_scan(bt_pair_session_t *s) {
 }
 
 static void second_fail(bt_pair_session_t *s, uint64_t now_ms, uint8_t status) {
-    const bool again = !s->user_held && !s->pair_active && !s->scan_hold && other_stored(s) != NULL;
+    const bool idle = s->second.idle_drop;
+    const bool again = !idle && !s->user_held && !s->pair_active && !s->scan_hold &&
+                       other_stored(s) != NULL;
     /* Timeout de pagina prende o radio por 10 s. Esperar mais deixa o controle
      * que ja esta ligado entregar os botoes entre as tentativas. */
     const uint32_t wait = (status == 0x04u || status == 0x08u)
@@ -175,7 +206,7 @@ static void second_fail(bt_pair_session_t *s, uint64_t now_ms, uint8_t status) {
     s->second.retry_at_ms = now_ms + wait;
 }
 
-static void second_establish(bt_pair_session_t *s) {
+static void second_establish(bt_pair_session_t *s, uint64_t now_ms) {
     if (s->second.player < 1u || s->second.player > 4u) {
         const bt_paired_device_t *known = bt_manager_find_paired(s->ipc, s->second.peer);
         if (known && known->player >= 1u && known->player <= 4u)
@@ -184,6 +215,9 @@ static void second_establish(bt_pair_session_t *s) {
     s->second.established = true;
     s->second.state = BT_PAIR_CONNECTED;
     s->second.retry_armed = false;
+    s->second.idle_drop = false;
+    s->second.used_ms = now_ms;
+    idle_forget(s, s->second.peer);
     note(s, "second up", s->second.player);
 }
 
@@ -231,13 +265,13 @@ static const uint8_t *stored_by_turn(const bt_pair_session_t *s) {
     if (!s || !s->ipc) return NULL;
     for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
         const bt_paired_device_t *d = &s->ipc->paired[i];
-        if (d->valid && !addr_is_live(s, d->bd_addr)) count++;
+        if (d->valid && !addr_is_live(s, d->bd_addr) && !idle_is(s, d->bd_addr)) count++;
     }
     if (count <= 0) return NULL;
     want = (int)(s->stored_turn % (uint8_t)count);
     for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
         const bt_paired_device_t *d = &s->ipc->paired[i];
-        if (!d->valid || addr_is_live(s, d->bd_addr)) continue;
+        if (!d->valid || addr_is_live(s, d->bd_addr) || idle_is(s, d->bd_addr)) continue;
         if (seen == want) return d->bd_addr;
         seen++;
     }
@@ -477,6 +511,8 @@ void bt_pair_session_adapter_lost(bt_pair_session_t *s) {
     s->phrase_id = BT_PHRASE_NONE;
     s->player = 0u;
     s->orphan_handle = ACL_NONE;
+    s->idle_on[0] = false;
+    s->idle_on[1] = false;
     clear_link(s);
     second_clear(s);
 }
@@ -553,6 +589,7 @@ void bt_pair_session_on_command(bt_pair_session_t *s, uint32_t command,
         return;
     }
     if (command == BT_IPC_CMD_CONNECT_PAIRED) {
+        if (addr) idle_forget(s, addr);
         if (s->state == BT_PAIR_IDLE && !s->pair_active) {
             s->user_held = false;
             if (addr && bt_manager_find_paired(s->ipc, addr)) {
@@ -655,6 +692,7 @@ static void on_connection_request(bt_pair_session_t *s, const uint8_t *p, uint64
     } else if (!s->pair_active && known && !primary_this &&
                !s->second.established && s->second.state != BT_PAIR_CONNECTING &&
                s->second.state != BT_PAIR_AUTH) {
+        idle_forget(s, addr);
         accept_second(s, addr);
         return;
     } else if (!known && stored && ds4_like) {
@@ -666,6 +704,7 @@ static void on_connection_request(bt_pair_session_t *s, const uint8_t *p, uint64
         send_cmd(s, HCI_OP_REJECT_CONN_REQ, reply, sizeof reply);
         return;
     }
+    idle_forget(s, addr);
     clear_link(s);
     memcpy(s->peer, addr, 6u);
     s->has_peer = true;
@@ -763,6 +802,9 @@ static void establish_link(bt_pair_session_t *s, uint64_t now_ms, bool ask_encry
         enc[2] = 0x01;
         send_cmd(s, HCI_OP_SET_CONN_ENCRYPT, enc, sizeof enc);
     }
+    s->used_ms = now_ms;
+    s->idle_drop = false;
+    idle_forget(s, s->peer);
     page_second(s);
 }
 
@@ -772,7 +814,7 @@ static void on_auth_complete(bt_pair_session_t *s, const uint8_t *p, uint64_t no
     if (s->second.state == BT_PAIR_AUTH && handle == s->second.acl_handle) {
         if (status == 0x0Cu || status == 0x00u) {
             note(s, status == 0x0Cu ? "second auth deferred" : "second auth ok", status);
-            if (s->second.encrypted) second_establish(s);
+            if (s->second.encrypted) second_establish(s, now_ms);
             else if (status == 0x00u && s->second.incoming) {
                 /* Quem entra não cifra sozinho. Sem este pedido o DS4 cai com 0x13. */
                 uint8_t enc[3];
@@ -812,7 +854,7 @@ static void on_encryption_change(bt_pair_session_t *s, const uint8_t *p, uint64_
     if (handle == s->second.acl_handle && s->second.active) {
         s->second.encrypted = status == 0x00u && p[3] != 0;
         note(s, "second encrypt", status);
-        if (s->second.encrypted && s->second.state == BT_PAIR_AUTH) second_establish(s);
+        if (s->second.encrypted && s->second.state == BT_PAIR_AUTH) second_establish(s, now_ms);
         return;
     }
     if (handle != s->acl_handle) return;
@@ -834,6 +876,12 @@ static void on_disconnection_complete(bt_pair_session_t *s, const uint8_t *p, ui
 
     if (s->state == BT_PAIR_CONNECTED && s->established) {
         const bool for_scan = s->scan_hold;
+        const bool idle = s->idle_drop;
+        if (idle) {
+            clear_link(s);
+            s->state = BT_PAIR_IDLE;
+            return;
+        }
         clear_link(s);
         s->state = BT_PAIR_IDLE;
         if (!for_scan && reason != HCI_REASON_LOCAL) {
@@ -934,6 +982,8 @@ void bt_pair_session_on_event(bt_pair_session_t *s, const uint8_t *evt, size_t l
     }
 }
 
+static void maybe_idle_drop(bt_pair_session_t *s, uint64_t now_ms);
+
 void bt_pair_session_tick(bt_pair_session_t *s, uint64_t now_ms) {
     if (!s || !s->adapter_ready) return;
 
@@ -957,4 +1007,32 @@ void bt_pair_session_tick(bt_pair_session_t *s, uint64_t now_ms) {
         connect_stored(s);
     }
     if (s->second.retry_armed && now_ms >= s->second.retry_at_ms) page_second(s);
+    maybe_idle_drop(s, now_ms);
+}
+
+void bt_pair_session_note_use(bt_pair_session_t *s, int slot, uint64_t now_ms) {
+    if (!s) return;
+    if (slot == 0 && s->established) s->used_ms = now_ms;
+    else if (slot == 1 && s->second.established) s->second.used_ms = now_ms;
+}
+
+static void maybe_idle_drop(bt_pair_session_t *s, uint64_t now_ms) {
+    if (!s->adapter_ready || s->pair_active) return;
+    if (s->established && !s->idle_drop && s->used_ms != 0 && s->acl_handle != ACL_NONE &&
+        now_ms >= s->used_ms && now_ms - s->used_ms >= BT_PAIR_IDLE_MS) {
+        idle_remember(s, s->peer);
+        s->idle_drop = true;
+        s->retry_armed = false;
+        disconnect_acl(s, s->acl_handle);
+        note(s, "idle drop", s->player);
+    }
+    if (s->second.established && !s->second.idle_drop && s->second.used_ms != 0 &&
+        s->second.acl_handle != ACL_NONE && now_ms >= s->second.used_ms &&
+        now_ms - s->second.used_ms >= BT_PAIR_IDLE_MS) {
+        idle_remember(s, s->second.peer);
+        s->second.idle_drop = true;
+        s->second.retry_armed = false;
+        disconnect_acl(s, s->second.acl_handle);
+        note(s, "idle drop", s->second.player);
+    }
 }
