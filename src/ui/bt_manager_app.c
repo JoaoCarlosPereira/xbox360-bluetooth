@@ -177,7 +177,9 @@ static void update_plugin_status(bt_ipc_state_t *ipc, plugin_client_t *client) {
                      reply.phrase_id, reply.player, reply.pair_active);
             client->log_state = IPC_REPLIED;
             client->adapter_stage = reply.adapter_stage;
-            ipc->dongle_ready = reply.usb_status == 0 && reply.adapter_stage == BT_USB_STAGE_READY;
+            ipc->dongle_ready = reply.usb_status == 0 &&
+                                reply.adapter_stage == BT_USB_STAGE_READY &&
+                                reply.phrase_id != BT_PHRASE_ADAPTER_FW_MISSING;
             bt_manager_apply_links(ipc, reply.player, reply.link);
             ipc->identify_player = reply.reserved;
 
@@ -219,7 +221,10 @@ static void update_plugin_status(bt_ipc_state_t *ipc, plugin_client_t *client) {
                 else if (ipc->dongle_ready && bt_manager_has_stored_ds4(ipc))
                     status = "DualShock 4 desconectado.";
                 else if (ipc->dongle_ready) status = "Adaptador pronto.";
-                else if (reply.adapter_stage == BT_USB_STAGE_ERROR)
+                else if (reply.phrase_id == BT_PHRASE_ADAPTER_FW_MISSING) {
+                    const char *phrase = bt_phase1_phrase_text(reply.phrase_id);
+                    if (phrase) status = phrase;
+                } else if (reply.adapter_stage == BT_USB_STAGE_ERROR)
                     status = "Falha ao iniciar o Bluetooth. Consulte o log.";
                 else if (reply.adapter_stage == BT_USB_STAGE_REMOVING)
                     status = "Bluetooth desconectado. Encerrando USB.";
