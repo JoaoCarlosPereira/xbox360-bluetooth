@@ -52,16 +52,26 @@ size_t ppc_copy_instruction(uint32_t *dst, const uint32_t *src, uint32_t src_add
  * Instala o desvio em source (endereco de execucao source_addr) para target_addr.
  * O trampolim (tramp, executavel em tramp_addr, tramp_cap palavras livres) recebe as 4
  * primeiras instrucoes da funcao e o retorno para source_addr + 16; tramp_addr passa a ser
- * o "original" chamavel. O retorno usa LR e devolve o CTR, entao a funcao so e desviada se
- * uma das 4 instrucoes for mflr (o LR original ja esta num registrador). Primeiro o trampolim
- * e esvaziado do cache, depois o desvio e escrito.
+ * o "original" chamavel. Se uma das 4 instrucoes for mflr, o retorno usa LR e devolve o CTR.
+ * Se a funcao continua depois dessas 4, o retorno usa o CTR e deixa o LR de quem chamou.
+ * Um thunk que ja termina em blr ou bctr nao e desviado. Primeiro o trampolim e esvaziado
+ * do cache, depois o desvio e escrito.
  * Retorna false se ja instalado, se os argumentos forem invalidos, se faltar espaco ou se
- * a funcao nao guardar o LR nessas 4 instrucoes.
+ * a funcao terminar nessas 4 instrucoes sem ter guardado o LR.
  * *tramp_used recebe as palavras consumidas.
  */
 bool ppc_detour_install(ppc_detour_t *d, uint32_t *source, uint32_t source_addr,
                         uint32_t target_addr, uint32_t *tramp, uint32_t tramp_addr,
                         size_t tramp_cap, size_t *tramp_used, ppc_flush_fn flush);
+
+/*
+ * Copia o corpo inteiro, até o bctr/blr/b final, no máximo 16 instruções.
+ * Não há salto de volta: o CTR e o LR do corpo ficam como estavam. Serve para
+ * o atalho curto do teclado, que o desvio comum derruba.
+ */
+bool ppc_detour_install_body(ppc_detour_t *d, uint32_t *source, uint32_t source_addr,
+                             uint32_t target_addr, uint32_t *tramp, uint32_t tramp_addr,
+                             size_t tramp_cap, size_t *tramp_used, ppc_flush_fn flush);
 
 #ifdef __cplusplus
 }
