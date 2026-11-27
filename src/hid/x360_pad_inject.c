@@ -188,6 +188,28 @@ uint32_t x360_pad_inject_filter_read_state(const x360_pad_inject_t *p, bool cont
     return X360_PAD_ERROR_SUCCESS;
 }
 
+static int16_t axis_or_rest(int16_t official, int16_t ds4) {
+    return official != 0 ? official : ds4;
+}
+
+void x360_pad_overlay_player1(x360_gamepad_state_t *slot, const x360_gamepad_state_t *ds4,
+                              bool official_present) {
+    if (!slot || !ds4) return;
+    x360_gamepad_state_t extra = *ds4;
+    extra.buttons = (uint16_t)(extra.buttons & (uint16_t)~X360_BTN_GUIDE);
+    if (!official_present) {
+        *slot = extra;
+        return;
+    }
+    slot->buttons = (uint16_t)(slot->buttons | extra.buttons);
+    if (slot->left_trigger == 0u) slot->left_trigger = extra.left_trigger;
+    if (slot->right_trigger == 0u) slot->right_trigger = extra.right_trigger;
+    slot->thumb_lx = axis_or_rest(slot->thumb_lx, extra.thumb_lx);
+    slot->thumb_ly = axis_or_rest(slot->thumb_ly, extra.thumb_ly);
+    slot->thumb_rx = axis_or_rest(slot->thumb_rx, extra.thumb_rx);
+    slot->thumb_ry = axis_or_rest(slot->thumb_ry, extra.thumb_ry);
+}
+
 /* Bit do botão Xbox -> VK_PAD_*. O guia (0x0400) não vira tecla. */
 static const uint16_t k_pad_vk[16] = {
     0x5810u, 0x5811u, 0x5812u, 0x5813u, /* cima, baixo, esquerda, direita */
