@@ -2,7 +2,7 @@
 
 Projeto experimental de pesquisa e desenvolvimento para adicionar suporte genérico a adaptadores **Bluetooth USB (HCI)** diretamente no **Xbox 360** (alvo inicial: Xbox 360 E com desbloqueio **ABadAvatar** + **XeUnshackle** + **Aurora**).
 
-> **Escopo atual (Fase 1–5):** Pesquisa de viabilidade, arquitetura e planejamento de protótipo mínimo para **detectar, inicializar e trocar comandos HCI** com um dongle Bluetooth USB genérico. Suporte a controles, teclados, mouses ou áudio Bluetooth **não** faz parte desta etapa.
+> **Estado em 26/11/2026:** o protótipo roda no Xbox 360 E. O plugin `bt360_proto.xex` sobe com o DashLaunch, o UGREEN `2B89:8761` (RTL8761BU) fica pronto e até dois DualShock 4 conectam ao mesmo tempo. O controle original permanece no jogador 1. O código está em `main`, commit `7784beb`. A tela nativa de perfil ainda precisa ser confirmada no próximo boot: ela pede teclas (`XamInputGetKeystroke`, ordinal 403), e esse caminho acabou de ir para o HD.
 
 ---
 
@@ -29,6 +29,8 @@ Projeto experimental de pesquisa e desenvolvimento para adicionar suporte genér
 | Fase 4 | Comparação e recomendação de arquitetura | Concluída |
 | Fase 5 | Planejamento do primeiro protótipo mínimo (HCI Reset + Read Local Version) | Concluída |
 | Fase 6 | Estruturação documental e preparação para primeiro experimento | Concluída |
+| Fase 7 | Plugin residente, firmware RTL8761BU, dois DualShock 4 e injeção no XamInput | No console; jogador 1 e telas nativas em confirmação |
+| Fase 8 | Telas nativas do sistema (perfil e guia) pelo DualShock, sem tirar o controle original | No HD (`7784beb`); falta o boot que carrega esse xex |
 
 ---
 
@@ -41,4 +43,5 @@ Projeto experimental de pesquisa e desenvolvimento para adicionar suporte genér
 - [`docs/architecture.md`](docs/architecture.md) — Comparação das alternativas arquiteturais (A, B, C, D) e recomendação.
 - [`docs/roadmap.md`](docs/roadmap.md) — Plano incremental e desenho do primeiro experimento.
 - [`research/`](research/README.md) — Referências técnicas e repositórios analisados.
-- [`src/`](src/README.md) — Reservado para o código experimental do protótipo.
+- [`src/`](src/README.md) — Pilha HCI/USB, sessão de pareamento, HID, injeção no XamInput, plugin e BTManager.
+- [`STATUS.md`](STATUS.md) — Handoff do que já foi visto no console e do que ainda falta confirmar.
