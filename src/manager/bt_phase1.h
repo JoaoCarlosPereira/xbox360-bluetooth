@@ -27,6 +27,7 @@ typedef enum {
     BT_PHRASE_DS4_DISCONNECTED,
     BT_PHRASE_DS4_PAIRED_PLAYER3,
     BT_PHRASE_DS4_PAIRED_PLAYER4,
+    BT_PHRASE_ADAPTER_FW_MISSING,
 } bt_phase1_phrase_id_t;
 
 typedef enum {
@@ -34,6 +35,7 @@ typedef enum {
     BT_PHASE1_ADAPTER_WRONG,
     BT_PHASE1_ADAPTER_READY,
     BT_PHASE1_ADAPTER_REMOVED,
+    BT_PHASE1_ADAPTER_FW_MISSING,
 } bt_phase1_adapter_state_t;
 
 typedef enum {
