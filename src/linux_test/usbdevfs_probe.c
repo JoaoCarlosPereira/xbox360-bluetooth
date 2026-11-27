@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "../hal/xbox360_usbd.h"
 #include "../transport/bt_usb_transport.h"
+#include "../chipset/bt_chipset.h"
 #include "../chipset/rtl8761b.h"
 
 #include <dirent.h>
@@ -98,16 +99,16 @@ static int find_and_open_bt_usb(uint16_t target_vid, uint16_t target_pid,
                 uint16_t vid = (uint16_t)desc[8] | ((uint16_t)desc[9] << 8);
                 uint16_t pid = (uint16_t)desc[10] | ((uint16_t)desc[11] << 8);
 
-                bool match = (target_vid != 0)
+                bool vidpid_match = (target_vid != 0)
                     ? (vid == target_vid && pid == target_pid)
-                    : bt_usb_is_hci_interface(dd->bDeviceClass, dd->bDeviceSubClass, dd->bDeviceProtocol);
+                    : (vid != BT_USB_VID_MICROSOFT && vid != BT_USB_VID_INTEL);
 
-                if (match) {
+                if (vidpid_match) {
                     memset(out_info, 0, sizeof(*out_info));
                     out_info->vid = vid;
                     out_info->pid = pid;
 
-                    /* Parse config + interface + endpoint descriptors appended after device descriptor */
+                    /* Parse config + interface + endpoint descriptors (supports bDeviceClass 0xE0, 0x00, 0xEF) */
                     size_t off = dd->bLength;
                     bool in_hci_iface = false;
                     while (off + 2 <= (size_t)n) {
@@ -117,9 +118,10 @@ static int find_and_open_bt_usb(uint16_t target_vid, uint16_t target_pid,
 
                         if (type == USB_DT_INTERFACE && len >= 9) {
                             struct usb_interface_descriptor *id = (struct usb_interface_descriptor *)(desc + off);
-                            if (bt_usb_is_hci_interface(id->bInterfaceClass,
-                                                        id->bInterfaceSubClass,
-                                                        id->bInterfaceProtocol) &&
+                            if (bt_chipset_match_usb(vid, pid,
+                                                     id->bInterfaceClass,
+                                                     id->bInterfaceSubClass,
+                                                     id->bInterfaceProtocol) == BT_USB_MATCH_ACCEPT &&
                                 id->bAlternateSetting == 0 && !out_info->has_intr_in) {
                                 out_info->interface_num = id->bInterfaceNumber;
                                 in_hci_iface = true;
@@ -249,7 +251,8 @@ static int rtl_chunk_sender(void *vctx, uint16_t opcode,
     return 0;
 }
 
-static int try_upload_realtek_fw(usbdevfs_ctx_t *u, const bt_usb_device_info_t *info) {
+static int try_upload_realtek_fw(usbdevfs_ctx_t *u, const bt_usb_device_info_t *info,
+                                 const bt_chipset_profile_t *profile) {
     rtl_sync_ctx_t sc = {
         .u = u,
         .iface_num = info->interface_num,
@@ -257,6 +260,8 @@ static int try_upload_realtek_fw(usbdevfs_ctx_t *u, const bt_usb_device_info_t *
     };
     uint8_t evt_accum[HCI_MAX_EVT_SIZE];
     hci_cmd_complete_t cc;
+
+    if (!profile || !profile->fw_name) return -1;
 
     if (sync_send_and_wait_cc(&sc, RTL_OP_READ_ROM_VERSION, NULL, 0, &cc, evt_accum, sizeof(evt_accum)) != 0 ||
         cc.params_len < 2 || cc.params[0] != 0x00) {
@@ -266,15 +271,21 @@ static int try_upload_realtek_fw(usbdevfs_ctx_t *u, const bt_usb_device_info_t *
     uint8_t rom_ver = cc.params[1];
     printf("  Realtek ROM version: %u\n", rom_ver);
 
+    char fw_path[256];
+    char cfg_path[256];
+    snprintf(fw_path, sizeof(fw_path), "/lib/firmware/rtl_bt/%s", profile->fw_name);
     uint8_t *fw_buf = NULL, *cfg_buf = NULL;
     size_t fw_sz = 0, cfg_sz = 0;
-    if (read_entire_file("/lib/firmware/rtl_bt/rtl8761bu_fw.bin", &fw_buf, &fw_sz) != 0) {
-        fprintf(stderr, "Could not open /lib/firmware/rtl_bt/rtl8761bu_fw.bin\n");
+    if (read_entire_file(fw_path, &fw_buf, &fw_sz) != 0) {
+        fprintf(stderr, "Could not open %s\n", fw_path);
         return -2;
     }
-    if (read_entire_file("/lib/firmware/rtl_bt/rtl8761bu_config.bin", &cfg_buf, &cfg_sz) != 0) {
-        cfg_buf = NULL;
-        cfg_sz = 0;
+    if (profile->cfg_name) {
+        snprintf(cfg_path, sizeof(cfg_path), "/lib/firmware/rtl_bt/%s", profile->cfg_name);
+        if (read_entire_file(cfg_path, &cfg_buf, &cfg_sz) != 0) {
+            cfg_buf = NULL;
+            cfg_sz = 0;
+        }
     }
 
     rtl_fw_image_t img;
@@ -410,10 +421,15 @@ int main(int argc, char **argv) {
                tr.bd_addr.bd_addr[5], tr.bd_addr.bd_addr[4], tr.bd_addr.bd_addr[3],
                tr.bd_addr.bd_addr[2], tr.bd_addr.bd_addr[1], tr.bd_addr.bd_addr[0]);
 
-        if (rtl_needs_firmware(&tr.local_ver)) {
-            printf("\nUnpatched Realtek ROM detected (lmp_subver=0x%04X). Loading firmware...\n",
-                   tr.local_ver.lmp_subversion);
-            if (try_upload_realtek_fw(&ctx, &info) == 0) {
+        bt_chipset_profile_t profile;
+        bt_chipset_identify(info.vid, info.pid, &tr.local_ver, &profile);
+        printf("  Chipset      : %s (needs_fw=%s, quirks=0x%X)\n",
+               profile.name, profile.needs_fw ? "yes" : "no", profile.quirks);
+
+        if (profile.needs_fw && (profile.quirks & BT_QUIRK_RTL_EPATCH_V1)) {
+            printf("\nUnpatched Realtek ROM detected (lmp_subver=0x%04X, fw=%s). Loading firmware...\n",
+                   tr.local_ver.lmp_subversion, profile.fw_name ? profile.fw_name : "(none)");
+            if (try_upload_realtek_fw(&ctx, &info, &profile) == 0) {
                 if (bt_usb_transport_init(&tr, &info, &hal) == 0 &&
                     bt_usb_transport_start_init(&tr) == 0) {
                     while (tr.state != BT_INIT_READY && tr.state != BT_INIT_ERROR) {
