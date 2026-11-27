@@ -786,6 +786,53 @@ static void test_retry_skips_the_controller_already_up(void) {
     printf("[PASS] a nova tentativa nao chama o controle que ja esta ligado\n");
 }
 
+static void test_idle_fifteen_minutes(void) {
+    rig_t r;
+    uint8_t e[32];
+    rig_init(&r, true);
+    bt_pair_session_adapter_ready(&r.s, 0);
+    feed(&r, e, evt_conn_complete(e, 0, 0x0030u, ADDR_A), 100);
+    feed(&r, e, evt_auth_complete(e, 0, 0x0030u), 110);
+    feed(&r, e, evt_encrypt(e, 0, 0x0030u, 1), 130);
+    assert(r.s.established && r.s.used_ms == 130u);
+
+    r.s.second.active = true;
+    r.s.second.established = true;
+    r.s.second.state = BT_PAIR_CONNECTED;
+    r.s.second.acl_handle = 0x0031u;
+    memcpy(r.s.second.peer, ADDR_B, 6u);
+    bt_pair_session_note_use(&r.s, 0, 1000u + BT_PAIR_IDLE_MS);
+    bt_pair_session_note_use(&r.s, 1, 1000u);
+
+    const int discs = count_op(&r.m, HCI_OP_DISCONNECT);
+    bt_pair_session_tick(&r.s, 1000u + BT_PAIR_IDLE_MS - 1u);
+    assert(count_op(&r.m, HCI_OP_DISCONNECT) == discs);
+    bt_pair_session_tick(&r.s, 1000u + BT_PAIR_IDLE_MS);
+    assert(count_op(&r.m, HCI_OP_DISCONNECT) == discs + 1);
+    const cmd_rec_t *d = last_op(&r.m, HCI_OP_DISCONNECT);
+    assert(d && hci_get_le16(d->params) == 0x0031u);
+    assert(r.s.established);
+    feed(&r, e, evt_disconnect(e, 0x0031u, 0x13), 1000u + BT_PAIR_IDLE_MS + 10u);
+    assert(!r.s.second.established && !r.s.second.retry_armed);
+
+    const uint64_t used = 1000u + BT_PAIR_IDLE_MS;
+    bt_pair_session_note_use(&r.s, 0, used);
+    const int creates = count_op(&r.m, HCI_OP_CREATE_CONNECTION);
+    bt_pair_session_tick(&r.s, used + BT_PAIR_IDLE_MS - 1u);
+    assert(r.s.established && count_op(&r.m, HCI_OP_DISCONNECT) == discs + 1);
+    bt_pair_session_tick(&r.s, used + BT_PAIR_IDLE_MS);
+    d = last_op(&r.m, HCI_OP_DISCONNECT);
+    assert(d && hci_get_le16(d->params) == 0x0030u);
+    feed(&r, e, evt_disconnect(e, 0x0030u, 0x13), used + BT_PAIR_IDLE_MS + 10u);
+    assert(!r.s.established && r.s.state == BT_PAIR_IDLE);
+    bt_pair_session_tick(&r.s, used + BT_PAIR_IDLE_MS + BT_PAIR_RECONNECT_RETRY_MS + 1000u);
+    assert(count_op(&r.m, HCI_OP_CREATE_CONNECTION) == creates);
+    feed(&r, e, evt_conn_request(e, ADDR_A, 0x002508u), used + BT_PAIR_IDLE_MS + 5000u);
+    const cmd_rec_t *acc = last_op(&r.m, HCI_OP_ACCEPT_CONN_REQ);
+    assert(acc && memcmp(acc->params, ADDR_A, 6) == 0);
+    printf("[PASS] 15 min parado desliga e o PS liga de novo\n");
+}
+
 int main(void) {
     test_par_05_reconnect_without_inquiry();
     test_link_key_reply_with_stored_key();
@@ -813,5 +860,6 @@ int main(void) {
     test_scan_releases_connected_ds4();
     test_scan_waits_until_both_links_drop();
     test_pair_command_ignored_without_adapter();
+    test_idle_fifteen_minutes();
     return 0;
 }
