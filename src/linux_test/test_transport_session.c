@@ -12,9 +12,11 @@
 typedef struct {
     uint16_t opcode[64];
     uint8_t  params0[64];
+    uint8_t  params5[64];
     int      n;
     int      fail_next;
     int      intr_submits;
+    int      release_calls;
     uint8_t *rx_buf;
     uint16_t rx_cap;
 } mock_hal_t;
@@ -27,6 +29,7 @@ static int hal_control(void *ctx, uint8_t type, uint8_t req, uint16_t value, uin
     assert(m->n < 64 && length >= HCI_CMD_HDR_SIZE);
     m->opcode[m->n] = hci_get_le16(data);
     m->params0[m->n] = length > HCI_CMD_HDR_SIZE ? data[HCI_CMD_HDR_SIZE] : 0;
+    m->params5[m->n] = length > HCI_CMD_HDR_SIZE + 5u ? data[HCI_CMD_HDR_SIZE + 5u] : 0;
     m->n++;
     return 0;
 }
@@ -34,6 +37,10 @@ static int hal_intr(void *ctx, uint8_t *buf, uint16_t max_len) {
     mock_hal_t *m = ctx;
     m->rx_buf = buf; m->rx_cap = max_len; m->intr_submits++;
     return 0;
+}
+static void hal_release_control(void *ctx) {
+    mock_hal_t *m = ctx;
+    m->release_calls++;
 }
 
 static void setup(bt_usb_transport_t *tr, mock_hal_t *m) {
@@ -44,7 +51,10 @@ static void setup(bt_usb_transport_t *tr, mock_hal_t *m) {
     dev.intr_in.bEndpointAddress = 0x81;
     dev.intr_in.bmAttributes = BT_USB_EP_TYPE_INTERRUPT;
     dev.intr_in.wMaxPacketSize = 16;
-    bt_usb_hal_ops_t hal = { .ctx = m, .submit_control_out = hal_control, .submit_intr_in = hal_intr };
+    bt_usb_hal_ops_t hal = {
+        .ctx = m, .submit_control_out = hal_control,
+        .submit_intr_in = hal_intr, .release_control = hal_release_control
+    };
     assert(bt_usb_transport_init(tr, &dev, &hal) == 0);
 }
 
@@ -269,6 +279,61 @@ static void test_active_transport(void) {
     printf("[PASS] transporte ativo acessivel ao plugin\n");
 }
 
+static void test_init_reset_retry_and_exhaust(void) {
+    bt_usb_transport_t tr; mock_hal_t m;
+    uint8_t e[64];
+    static const uint8_t ok[] = { 0 };
+    static const uint8_t ver[] = { 0, 6, 0xBB, 0x22, 6, 0x0A, 0, 0xBB, 0x22 };
+    static const uint8_t bd[] = { 0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 };
+
+    /* 1st reset times out, 2nd succeeds and finishes init. */
+    setup(&tr, &m);
+    assert(bt_usb_transport_start_init(&tr) == 0);
+    assert(m.n == 1 && m.opcode[0] == HCI_OP_RESET);
+    bt_usb_transport_pump(&tr, BT_USB_CMD_TIMEOUT_MS);
+    assert(m.release_calls == 1);
+    assert(m.n == 2 && m.opcode[1] == HCI_OP_RESET);
+    assert(tr.state == BT_INIT_WAIT_RESET);
+    deliver(&tr, e, cc_evt(e, HCI_OP_RESET, ok, 1));
+    assert(tr.state == BT_INIT_WAIT_LOCAL_VER);
+    deliver(&tr, e, cc_evt(e, HCI_OP_READ_LOCAL_VERSION_INFO, ver, sizeof ver));
+    deliver(&tr, e, cc_evt(e, HCI_OP_READ_BD_ADDR, bd, sizeof bd));
+    assert(tr.state == BT_INIT_READY);
+
+    /* Exhausting all retries transitions to BT_INIT_ERROR. */
+    setup(&tr, &m);
+    assert(bt_usb_transport_start_init(&tr) == 0);
+    for (unsigned i = 0; i < BT_USB_INIT_MAX_RETRIES; i++) {
+        bt_usb_transport_pump(&tr, BT_USB_CMD_TIMEOUT_MS);
+    }
+    assert(tr.state == BT_INIT_ERROR && tr.last_error == -12);
+    assert(m.n == (int)BT_USB_INIT_MAX_RETRIES);
+    printf("[PASS] retry de HCI_Reset no init e erro limpo ao esgotar tentativas\n");
+}
+
+static void test_inquiry_fallbacks_for_cheap_dongles(void) {
+    bt_usb_transport_t tr; mock_hal_t m;
+    setup(&tr, &m);
+    init_ready(&tr, &m);
+    uint8_t e[16];
+    static const uint8_t err[] = { 0x12 }; /* Invalid HCI Command Parameters */
+    static const uint8_t ok[] = { 0x00 };
+
+    assert(bt_usb_transport_start_inquiry(&tr, 4) == 0);
+    assert(m.n == 1 && m.opcode[0] == HCI_OP_SET_EVENT_MASK && m.params5[0] == 0xF8u);
+    /* Clone rejects full Classic+SSP mask -> falls back to legacy mask (byte 5 == 0x00). */
+    deliver(&tr, e, cc_evt(e, HCI_OP_SET_EVENT_MASK, err, 1));
+    assert(m.n == 2 && m.opcode[1] == HCI_OP_SET_EVENT_MASK && m.params5[1] == 0x00u);
+    deliver(&tr, e, cc_evt(e, HCI_OP_SET_EVENT_MASK, ok, 1));
+    assert(m.n == 3 && m.opcode[2] == HCI_OP_WRITE_INQUIRY_MODE && m.params0[2] == 2u);
+    /* Clone rejects EIR mode (2) -> falls back to RSSI mode (1), then sends Inquiry. */
+    deliver(&tr, e, cc_evt(e, HCI_OP_WRITE_INQUIRY_MODE, err, 1));
+    assert(m.n == 4 && m.opcode[3] == HCI_OP_WRITE_INQUIRY_MODE && m.params0[3] == 1u);
+    deliver(&tr, e, cc_evt(e, HCI_OP_WRITE_INQUIRY_MODE, ok, 1));
+    assert(m.n == 5 && m.opcode[4] == HCI_OP_INQUIRY);
+    printf("[PASS] fallbacks de Set_Event_Mask e Write_Inquiry_Mode para clones baratos\n");
+}
+
 int main(void) {
     test_command_queue_serializes();
     test_queue_limits_and_hal_failure();
@@ -278,5 +343,7 @@ int main(void) {
     test_inquiry_over_queue();
     test_remote_name_fills_scan_item();
     test_active_transport();
+    test_init_reset_retry_and_exhaust();
+    test_inquiry_fallbacks_for_cheap_dongles();
     return 0;
 }
