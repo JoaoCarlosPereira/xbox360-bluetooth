@@ -36,14 +36,28 @@ Este documento analisa o comportamento de diferentes famílias de chipsets Bluet
 
 ---
 
-## 3. Estratégia de Arquitetura para Compatibilidade Genérica
+## 3. Estratégia de Arquitetura Implementada (`src/chipset/bt_chipset.c`)
 
 Para não ficar preso a um único fabricante:
 
 1. **Núcleo Genérico (Camada 1 — Padrão USB HCI):**
-   - Detecta qualquer dispositivo `0xE0 / 0x01 / 0x01` (ou lista de VID/PID conhecidos que usem `0xFF`).
-   - Executa `SET_CONFIGURATION`, abre EP0 (Control), Interrupt IN, Bulk IN e Bulk OUT.
-   - Envia `HCI_Reset` e `HCI_Read_Local_Version_Information`.
-2. **Camada de Quirks e Firmware Loaders (Camada 2 — Extensível):**
-   - Tabela de `(VID, PID)` $\rightarrow$ `bt_chipset_ops` (ex: `realtek_setup()`, `barrot_quirks()`, `broadcom_setup()`).
-   - Se um chipset precisar de firmware (`.bin` / `.hcd`), ele poderá ser lido de `Usb:\bt_fw\` ou `Hdd:\bt_fw\` em etapas futuras, sem alterar o núcleo HCI USB.
+   - `bt_chipset_match_usb()` aceita qualquer dispositivo padrão `0xE0 / 0x01 / 0x01` na Interface 0 / AltSetting 0, protegendo dispositivos Microsoft (`0x045E`) e recusando bootloaders Intel (`0x8087`).
+   - Executa `SET_CONFIGURATION`, abre EP0 (Control), Interrupt IN, Bulk IN e Bulk OUT, envia `HCI_Reset` (com até 3 tentativas em caso de timeout), `HCI_Read_Local_Version_Information` e `HCI_Read_BD_ADDR`.
+   - Usa máscara de eventos Bluetooth Classic + SSP + EIR sem bits reservados/LE (`FF FF FB FF 07 F8 B7 00`) com fallback automático para clones antigos, além de fallback `Write_Inquiry_Mode(0x02 -> 0x01)`.
+2. **Camada de Quirks e Firmware Loaders (Camada 2 — `bt_chipset_identify` + `rtl_boot.c`):**
+   - Classifica automaticamente Realtek (`0x005D`), CSR/Qualcomm (`0x000A` / `0x0A12`), Barrot (`0x08E7` / `0x33FA`), Actions (`0x03E0` / `0x10D7`), Broadcom (`0x000F`) e genéricos.
+   - Dongles Plug & Play (CSR, Barrot, Actions, genéricos) inicializam **sem nenhum `.bin` no pendrive**.
+   - Dongles Realtek EPATCH v1 (`RTL8761BU`, `RTL8761A`, `RTL8761BTV`, `RTL8821C`) buscam o firmware em `Usb:\bt_fw\` com fallback na raiz `Usb:\`. Caso ausente, o console exibe `"Firmware do adaptador ausente no USB."`.
+
+---
+
+## 4. Matriz de Evidência no Xbox 360
+
+| Adaptador / Chipset | VID:PID | Precisa de Firmware? | Status no Xbox 360 |
+| :--- | :--- | :--- | :--- |
+| **UGREEN (Realtek RTL8761BU)** | `2B89:8761` | Sim (`rtl8761bu_fw.bin`) | **[COMPROVADO XBOX]** Pareamento, reconexão e 2x DS4 validados |
+| **TP-Link UB500 / Orico / Baseus / Genérico (RTL8761BU)** | `2357:0604`, `0BDA:8771`, etc. | Sim (`rtl8761bu_fw.bin`) | **[AGUARDANDO TESTE XBOX]** Mesmo chipset/firmware do UGREEN |
+| **CSR8510 A10 e clones baratos** | `0A12:0001` | **Não** | **[AGUARDANDO TESTE XBOX]** Suporte genérico + fallbacks HCI ativos |
+| **Barrot BR8051 / BR8554 / BR8654 (BT 5.3/5.4)** | `33FA:0010` | **Não** | **[AGUARDANDO TESTE XBOX]** Suporte genérico ativo (`0x1005` não é chamado) |
+| **Actions ATS2851 (BT 5.3)** | `10D7:B012` | **Não** | **[AGUARDANDO TESTE XBOX]** Suporte genérico ativo |
+| **Intel (AX200/AX210/8265)** | `8087:*` | Sim (`.sfi`/`.ddc`) | **[NÃO SUPORTADO]** Recusado explicitamente no match USB |
