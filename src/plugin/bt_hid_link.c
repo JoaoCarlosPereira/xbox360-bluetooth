@@ -135,6 +135,12 @@ static hid_slot_t *slot_for_handle(uint16_t handle) {
 
 void bt_hid_link_on_acl(const uint8_t *data, size_t len) {
     if (!data || !len) return;
+    /* Um pedaço incompleto de um ACL não pode ser colado no pacote do outro. */
+    if (len >= 4u && g_accum_len >= 4u) {
+        const uint16_t incoming = (uint16_t)(hci_get_le16(data) & 0x0FFFu);
+        const uint16_t pending = (uint16_t)(hci_get_le16(g_accum) & 0x0FFFu);
+        if (incoming != pending) g_accum_len = 0;
+    }
     if (g_accum_len + len > sizeof g_accum) g_accum_len = 0;
     if (g_accum_len + len > sizeof g_accum) return;
     memcpy(g_accum + g_accum_len, data, len);
