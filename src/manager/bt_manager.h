@@ -142,6 +142,10 @@ int bt_manager_active_bt_count(const bt_ipc_state_t *ipc);
 /* Move o endereco para o jogador 1..4. Se outro controle ocupa esse jogador, os dois trocam. */
 int bt_manager_set_player(bt_ipc_state_t *ipc, const uint8_t bd_addr[6], uint8_t player);
 
+/* O XAM entrega o usuário livre. O jogador é esse usuário mais um.
+ * Usuário 0 com o controle oficial ligado, usuário repetido ou fora de 0..3 devolve 0. */
+uint8_t bt_player_for_bound_user(bool official_on_player1, uint8_t xam_user, uint8_t other_user);
+
 /* Dois links no reply de 32 bytes: jogador no nibble, estado nos 2 bits. */
 void bt_manager_pack_links(uint8_t *player_byte, uint8_t *link_byte,
                            uint8_t player_a, uint8_t link_a,
