@@ -164,7 +164,8 @@ static void second_fail(bt_pair_session_t *s, uint64_t now_ms, uint8_t status) {
     const bool again = !s->user_held && !s->pair_active && !s->scan_hold && other_stored(s) != NULL;
     /* Timeout de pagina prende o radio por 10 s. Esperar mais deixa o controle
      * que ja esta ligado entregar os botoes entre as tentativas. */
-    const uint32_t wait = status == 0x04u ? 20000u : BT_PAIR_RECONNECT_RETRY_MS;
+    const uint32_t wait = (status == 0x04u || status == 0x08u)
+                              ? BT_PAIR_LISTEN_MS : BT_PAIR_RECONNECT_RETRY_MS;
     second_clear(s);
     if (!again) {
         begin_held_scan(s);
@@ -287,13 +288,22 @@ static void link_failed(bt_pair_session_t *s, uint64_t now_ms, uint8_t status) {
         maybe_start_inquiry(s); /* o limite de 60 s e checado no tick */
     } else {
         s->state = BT_PAIR_IDLE;
+        s->has_peer = false;
         if (s->scan_hold) {
             begin_held_scan(s);
             return;
         }
-        /* 0x04 página, 0x08 conexão: o controle não atendeu. O próximo é o outro gravado. */
-        if (status == 0x04u || status == 0x08u) s->stored_turn++;
-        arm_retry(s, now_ms);
+        /* 0x04 página, 0x08 conexão: o controle não atendeu. O próximo é o outro gravado.
+         * A espera longa deixa o rádio em escuta: o controle liga sozinho nesse intervalo. */
+        if (status == 0x04u || status == 0x08u) {
+            s->stored_turn++;
+            if (!s->user_held && bt_pair_session_stored_addr(s)) {
+                s->retry_armed = true;
+                s->retry_at_ms = now_ms + BT_PAIR_LISTEN_MS;
+            }
+        } else {
+            arm_retry(s, now_ms);
+        }
     }
 }
 
@@ -626,22 +636,29 @@ static void on_connection_request(bt_pair_session_t *s, const uint8_t *p, uint64
     uint8_t reply[7];
     memcpy(reply, addr, 6u);
 
+    const bool known = bt_manager_find_paired(s->ipc, addr) != NULL;
+    const bool primary_this = s->has_peer && addr_eq(addr, s->peer);
     bool accept = false;
-    if (stored && addr_eq(addr, stored)) {
-        accept = s->state == BT_PAIR_IDLE || s->state == BT_PAIR_CONNECTING;
+    /* O gravado que estamos chamando também pode ligar sozinho. Recusar isso
+     * publica "já existe um DualShock 4" e o controle desiste. */
+    if (known && primary_this &&
+        (s->state == BT_PAIR_IDLE || s->state == BT_PAIR_CONNECTING)) {
+        accept = true;
+    } else if (stored && addr_eq(addr, stored) &&
+               (s->state == BT_PAIR_IDLE || s->state == BT_PAIR_CONNECTING)) {
+        accept = true;
     } else if (s->pair_active && s->state == BT_PAIR_SCANNING && ds4_like &&
                (!s->has_target || addr_eq(addr, s->target)) &&
                stored_count(s) < 4) {
         accept = true;
         if (s->ops.stop_inquiry) s->ops.stop_inquiry(s->ops.ctx);
-    } else if (!s->pair_active && ds4_like && bt_manager_find_paired(s->ipc, addr) &&
-               !(s->has_peer && addr_eq(addr, s->peer)) &&
+    } else if (!s->pair_active && known && !primary_this &&
                !s->second.established && s->second.state != BT_PAIR_CONNECTING &&
                s->second.state != BT_PAIR_AUTH) {
         accept_second(s, addr);
         return;
-    } else if (stored && ds4_like) {
-        second_ds4_notice(s, addr, now_ms); /* desconhecido, ou os dois lugares já estão ocupados */
+    } else if (!known && stored && ds4_like) {
+        second_ds4_notice(s, addr, now_ms);
     }
 
     if (!accept) {
@@ -667,12 +684,12 @@ static void on_connection_complete(bt_pair_session_t *s, const uint8_t *p, uint6
     const uint16_t handle = (uint16_t)(hci_get_le16(p + 1) & 0x0FFFu);
     const uint8_t *addr = p + 3;
     if (p[9] != 0x01u) return; /* so ACL */
-    /* 0x04 esgota a página sem subir o ACL. O Disconnect nesse handle, no mesmo
-     * instante, cai no outro controle que entra e reaproveita o número (0x16).
-     * O handle fica anotado e só sai se o próximo Create Connection voltar 0x0B. */
+    /* 0x04 esgota a página, 0x08 estoura a conexão e 0x16 é o nosso próprio
+     * Disconnect. Cortar o handle nesse instante derruba o controle que entra
+     * e reaproveita o número. O handle fica anotado e só sai no 0x0B. */
     if (status == 0x00u && handle == s->orphan_handle)
         s->orphan_handle = ACL_NONE;
-    else if (status != 0x00u && status != 0x04u && status != 0x16u)
+    else if (status != 0x00u && status != 0x04u && status != 0x08u && status != 0x16u)
         release_orphan(s, handle);
     else if (status != 0x00u && handle != 0 && handle != ACL_NONE)
         s->orphan_handle = handle;
@@ -696,6 +713,7 @@ static void on_connection_complete(bt_pair_session_t *s, const uint8_t *p, uint6
         return;
     }
     if (status != 0x00u) {
+        if (s->incoming) return; /* a página antiga; o controle já entrou */
         note(s, "connect failed", status);
         link_failed(s, now_ms, status);
         return;
@@ -755,6 +773,13 @@ static void on_auth_complete(bt_pair_session_t *s, const uint8_t *p, uint64_t no
         if (status == 0x0Cu || status == 0x00u) {
             note(s, status == 0x0Cu ? "second auth deferred" : "second auth ok", status);
             if (s->second.encrypted) second_establish(s);
+            else if (status == 0x00u && s->second.incoming) {
+                /* Quem entra não cifra sozinho. Sem este pedido o DS4 cai com 0x13. */
+                uint8_t enc[3];
+                hci_put_le16(enc, handle);
+                enc[2] = 0x01u;
+                send_cmd(s, HCI_OP_SET_CONN_ENCRYPT, enc, sizeof enc);
+            }
             return;
         }
         note(s, "second auth failed", status);
