@@ -711,7 +711,7 @@ static uint32_t keystroke_from_ds4(uint32_t status, uint32_t user, x360_keystrok
     x360_gamepad_state_t merged;
     bool any = false;
     x360_pad_snapshot_t snap;
-    if (status == 0u || !key) return status;
+    if (!key) return status;
     if (user != 0u && user != 0xFFu) return status;
     memset(&merged, 0, sizeof merged);
     if (g_pad_bound) {
@@ -729,19 +729,31 @@ static uint32_t keystroke_from_ds4(uint32_t status, uint32_t user, x360_keystrok
         }
     }
     if (!any) return status;
-    if (x360_pad_keystroke_next(&g_key_tracker, &merged, 0u, (uint32_t)now_ms(), key) != 0u)
-        return status;
-    return 0u;
+    return x360_pad_keystroke_filter(&g_key_tracker, &merged, status, key, 0u, (uint32_t)now_ms());
+}
+
+/* O teclado do sistema trata o Y e, no meio disso, pede outra tecla.
+ * Entrar de novo no atalho sobrescreve o CTR da chamada que ainda não voltou. */
+static volatile uint32_t g_key_busy;
+
+static uint32_t hook_key_guard(xam_keystroke_fn orig, uint32_t user, uint32_t flags,
+                               x360_keystroke_t *key) {
+    if (__atomic_fetch_add(&g_key_busy, 1u, __ATOMIC_ACQ_REL) != 0u) {
+        __atomic_fetch_sub(&g_key_busy, 1u, __ATOMIC_ACQ_REL);
+        return X360_PAD_ERROR_EMPTY;
+    }
+    const uint32_t status = orig ? orig(user, flags, key) : X360_PAD_ERROR_EMPTY;
+    const uint32_t out = keystroke_from_ds4(status, user, key);
+    __atomic_fetch_sub(&g_key_busy, 1u, __ATOMIC_ACQ_REL);
+    return out;
 }
 
 static uint32_t hook_keystroke(uint32_t user, uint32_t flags, x360_keystroke_t *key) {
-    const uint32_t status = g_orig_keystroke(user, flags, key);
-    return keystroke_from_ds4(status, user, key);
+    return hook_key_guard(g_orig_keystroke, user, flags, key);
 }
 
 static uint32_t hook_keystroke_hud(uint32_t user, uint32_t flags, x360_keystroke_t *key) {
-    const uint32_t status = g_orig_keystroke_hud(user, flags, key);
-    return keystroke_from_ds4(status, user, key);
+    return hook_key_guard(g_orig_keystroke_hud, user, flags, key);
 }
 
 static bool hook_install(const char *name, HANDLE module, uint32_t ordinal, unsigned index,
@@ -963,6 +975,7 @@ static void pad_service(void) {
         }
     }
     x360_pad_inject_publish(&g_pad, true, g_pad_player, &g_pad_report, g_pad_ps);
+    if (x360_pad_in_use(&g_pad_report)) bt_pair_session_note_use(&g_session, 0, now_ms());
     /* O painel visível é o do perfil do controle oficial (usuário 0), não o do jogador 2. */
     const bool guide_down = g_pad_ps || g_pad2_ps;
     const uint32_t now = (uint32_t)now_ms();
@@ -1067,6 +1080,7 @@ static void pad2_service(void) {
         }
     }
     x360_pad_inject_publish(&g_pad2, true, g_pad2_player, &g_pad2_report, g_pad2_ps);
+    if (x360_pad_in_use(&g_pad2_report)) bt_pair_session_note_use(&g_session, 1, now_ms());
 }
 
 static void pad_setup(void) {
