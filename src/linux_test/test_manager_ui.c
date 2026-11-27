@@ -638,6 +638,15 @@ static void test_empty_player1_card_takes_the_live_controller(void) {
     printf("[PASS] A no card vazio do jogador 1 leva o controle que esta no ar\n");
 }
 
+static void test_auto_player_follows_the_free_user(void) {
+    assert(bt_player_for_bound_user(true, 0u, 0xFFu) == 0u);
+    assert(bt_player_for_bound_user(true, 1u, 0xFFu) == 2u);
+    assert(bt_player_for_bound_user(true, 2u, 1u) == 3u);
+    assert(bt_player_for_bound_user(true, 1u, 1u) == 0u);
+    assert(bt_player_for_bound_user(false, 0u, 0xFFu) == 1u);
+    printf("[PASS] controle no usuario livre vira o jogador seguinte\n");
+}
+
 int main(void) {
     test_paired_ini_roundtrip();
     test_par05_player_roundtrip();
@@ -659,5 +668,6 @@ int main(void) {
     test_two_links_reach_two_players();
     test_ergonomics_focus_memory_and_two_bt_limit();
     test_empty_player1_card_takes_the_live_controller();
+    test_auto_player_follows_the_free_user();
     return 0;
 }
