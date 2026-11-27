@@ -171,8 +171,23 @@ void bt_usb_transport_pump(bt_usb_transport_t *tr, uint32_t elapsed_ms) {
     if (__atomic_load_n(&tr->cmd_inflight, __ATOMIC_ACQUIRE)) {
         tr->inflight_age_ms += elapsed_ms;
         if (tr->inflight_age_ms >= BT_USB_CMD_TIMEOUT_MS) {
+            const uint16_t expired_op = tr->inflight_opcode;
             tr->cmd_timeouts++;
             __atomic_store_n(&tr->cmd_inflight, 0u, __ATOMIC_RELEASE);
+            if (tr->hal.release_control) {
+                tr->hal.release_control(tr->hal.ctx);
+            }
+            if (tr->state == BT_INIT_WAIT_RESET ||
+                tr->state == BT_INIT_WAIT_LOCAL_VER ||
+                tr->state == BT_INIT_WAIT_BD_ADDR) {
+                if (tr->init_retries + 1u < BT_USB_INIT_MAX_RETRIES) {
+                    tr->init_retries++;
+                    send_hci_cmd(tr, expired_op, NULL, 0);
+                } else {
+                    tr->state = BT_INIT_ERROR;
+                    tr->last_error = -12;
+                }
+            }
         }
     }
     tx_flush(tr);
@@ -243,6 +258,7 @@ int bt_usb_transport_start_init(bt_usb_transport_t *tr) {
     tr->has_local_ver = false;
     tr->has_bd_addr = false;
     tr->last_error = 0;
+    tr->init_retries = 0;
 
     if (arm_intr_in(tr) != 0) {
         tr->state = BT_INIT_ERROR;
@@ -408,12 +424,24 @@ static void handle_hci_event(bt_usb_transport_t *tr,
     }
 
     if (cc.opcode == HCI_OP_SET_EVENT_MASK && tr->scan_active) {
+        if (cc.params_len >= 1u && cc.params[0] != 0x00u && !tr->mask_fallback_tried) {
+            static const uint8_t legacy_mask[8] = HCI_EVENT_MASK_LEGACY_INIT;
+            tr->mask_fallback_tried = 1u;
+            send_hci_cmd(tr, HCI_OP_SET_EVENT_MASK, legacy_mask, sizeof(legacy_mask));
+            return;
+        }
         uint8_t mode = 0x02u; /* Extended Inquiry Result */
         send_hci_cmd(tr, HCI_OP_WRITE_INQUIRY_MODE, &mode, 1);
         return;
     }
 
     if (cc.opcode == HCI_OP_WRITE_INQUIRY_MODE && tr->scan_active) {
+        if (cc.params_len >= 1u && cc.params[0] != 0x00u && !tr->inq_mode_fallback_tried) {
+            uint8_t mode = 0x01u; /* Inquiry Result with RSSI fallback */
+            tr->inq_mode_fallback_tried = 1u;
+            send_hci_cmd(tr, HCI_OP_WRITE_INQUIRY_MODE, &mode, 1);
+            return;
+        }
         /* GIAC LAP = 0x9E8B33 (little-endian: 33 8B 9E), length, unlimited responses */
         uint8_t inq_params[5] = { 0x33u, 0x8Bu, 0x9Eu, tr->scan_duration, 0x00u };
         if (send_hci_cmd(tr, HCI_OP_INQUIRY, inq_params, sizeof(inq_params)) != 0) {
@@ -428,6 +456,7 @@ static void handle_hci_event(bt_usb_transport_t *tr,
         case BT_INIT_WAIT_RESET:
             if (cc.opcode == HCI_OP_RESET) {
                 if (cc.params_len >= 1 && cc.params[0] == 0x00) {
+                    tr->init_retries = 0;
                     tr->state = BT_INIT_WAIT_LOCAL_VER;
                     if (send_hci_cmd(tr, HCI_OP_READ_LOCAL_VERSION_INFO, NULL, 0) != 0) {
                         tr->state = BT_INIT_ERROR;
@@ -444,6 +473,7 @@ static void handle_hci_event(bt_usb_transport_t *tr,
             if (cc.opcode == HCI_OP_READ_LOCAL_VERSION_INFO) {
                 if (hci_decode_local_version(&cc, &tr->local_ver) == 0 &&
                     tr->local_ver.status == 0x00) {
+                    tr->init_retries = 0;
                     tr->has_local_ver = true;
                     tr->state = BT_INIT_WAIT_BD_ADDR;
                     if (send_hci_cmd(tr, HCI_OP_READ_BD_ADDR, NULL, 0) != 0) {
@@ -461,6 +491,7 @@ static void handle_hci_event(bt_usb_transport_t *tr,
             if (cc.opcode == HCI_OP_READ_BD_ADDR) {
                 if (hci_decode_bd_addr(&cc, &tr->bd_addr) == 0 &&
                     tr->bd_addr.status == 0x00) {
+                    tr->init_retries = 0;
                     tr->has_bd_addr = true;
                     tr->state = BT_INIT_READY;
                 } else {
@@ -491,14 +522,14 @@ int bt_usb_transport_start_inquiry(bt_usb_transport_t *tr, uint8_t duration_1280
     tr->name_hold = 0;
     tr->name_tries = 0;
     tr->name_wait_ms = 0;
+    tr->mask_fallback_tried = 0;
+    tr->inq_mode_fallback_tried = 0;
 
     /* Interrupt IN ja esta armado desde o init (on_intr_in rearma); armar aqui,
      * de outra thread, poderia reenfileirar um TRB ainda pendente no HAL. */
 
-    /* Enable all standard + Extended Inquiry Result events (bits 0..63) */
-    static const uint8_t event_mask[8] = {
-        0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0x3Fu
-    };
+    /* BT 2.1+ Classic + SSP + EIR mask without reserved/LE bits (safe for cheap clones). */
+    static const uint8_t event_mask[8] = HCI_EVENT_MASK_CLASSIC_SSP_INIT;
     const int rc = send_hci_cmd(tr, HCI_OP_SET_EVENT_MASK, event_mask, sizeof(event_mask));
     if (rc != 0) {
         tr->scan_active = false;
