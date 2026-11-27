@@ -6,7 +6,7 @@ static const char *const k_phrases[] = {
     [BT_PHRASE_NONE]                   = NULL,
     [BT_PHRASE_ADAPTER_READY]          = "Adaptador Bluetooth pronto",
     [BT_PHRASE_ADAPTER_NOT_FOUND]      = "Adaptador Bluetooth não encontrado.",
-    [BT_PHRASE_ADAPTER_WRONG]          = "Este adaptador não faz parte desta entrega.",
+    [BT_PHRASE_ADAPTER_WRONG]          = "Adaptador Bluetooth incompatível.",
     [BT_PHRASE_ADAPTER_DISCONNECTED]   = "Adaptador Bluetooth desconectado.",
     [BT_PHRASE_DS4_PAIRED_PLAYER1]     = "DualShock 4 pareado no Jogador 1",
     [BT_PHRASE_DS4_PAIRED_PLAYER2]     = "DualShock 4 pareado no Jogador 2",
@@ -15,6 +15,7 @@ static const char *const k_phrases[] = {
     [BT_PHRASE_DS4_DISCONNECTED]       = "DualShock 4 desconectado.",
     [BT_PHRASE_DS4_PAIRED_PLAYER3]     = "DualShock 4 pareado no Jogador 3",
     [BT_PHRASE_DS4_PAIRED_PLAYER4]     = "DualShock 4 pareado no Jogador 4",
+    [BT_PHRASE_ADAPTER_FW_MISSING]     = "Firmware do adaptador ausente no USB.",
 };
 
 static bt_phase1_decision_t decision_no_phrase(void)
@@ -53,6 +54,9 @@ bt_phase1_decision_t bt_phase1_decide(const bt_phase1_context_t *ctx)
             break;
         case BT_PHASE1_ADAPTER_REMOVED:
             out.phrase_id = BT_PHRASE_ADAPTER_DISCONNECTED;
+            break;
+        case BT_PHASE1_ADAPTER_FW_MISSING:
+            out.phrase_id = BT_PHRASE_ADAPTER_FW_MISSING;
             break;
         }
         break;
