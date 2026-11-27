@@ -52,6 +52,17 @@ static bool same(const x360_gamepad_state_t *a, const x360_gamepad_state_t *b) {
     return memcmp(a, b, sizeof *a) == 0;
 }
 
+/* DS4_STATE cabe na zona morta: o slot publicado zera os quatro eixos. */
+static x360_gamepad_state_t published_ds4(bool guide) {
+    x360_gamepad_state_t s = DS4_STATE;
+    s.thumb_lx = 0;
+    s.thumb_ly = 0;
+    s.thumb_rx = 0;
+    s.thumb_ry = 0;
+    if (guide) s.buttons = (uint16_t)(s.buttons | X360_BTN_GUIDE);
+    return s;
+}
+
 static void test_pad_01_no_pairing_no_write(void) {
     env_t e; x360_pad_inject_t p;
     env_init(&e, &p, true);
@@ -77,7 +88,8 @@ static void test_pad_02_official_on_1_goes_to_2(void) {
     assert(d.player == 2u);
 
     assert(x360_pad_inject_publish(&p, true, d.player, &DS4_STATE, false));
-    assert(same(&e.slots[1], &DS4_STATE));
+    const x360_gamepad_state_t want = published_ds4(false);
+    assert(same(&e.slots[1], &want));
     assert(e.writes[1] == 1);
     assert(same(&e.slots[0], &OFFICIAL)); /* oficial intocado */
     assert(e.writes[0] == 0);
@@ -96,7 +108,8 @@ static void test_pad_03_no_official_goes_to_1(void) {
     assert(d.player == 1u);
 
     assert(x360_pad_inject_publish(&p, true, d.player, &DS4_STATE, false));
-    assert(same(&e.slots[0], &DS4_STATE));
+    const x360_gamepad_state_t want = published_ds4(false);
+    assert(same(&e.slots[0], &want));
     assert(e.writes[0] == 1);
     assert(e.writes[1] == 0 && e.writes[2] == 0 && e.writes[3] == 0);
     printf("[PASS] PAD-03 sem oficial: estado cai no slot 1\n");
@@ -154,7 +167,8 @@ static void test_pad_06_player_change_releases_old_slot(void) {
     assert(x360_pad_inject_publish(&p, true, 2u, &DS4_STATE, false));
     const x360_gamepad_state_t zero = { 0 };
     assert(same(&e.slots[0], &zero)); /* slot antigo liberado */
-    assert(same(&e.slots[1], &DS4_STATE));
+    const x360_gamepad_state_t want = published_ds4(false);
+    assert(same(&e.slots[1], &want));
     printf("[PASS] PAD-06 troca de jogador libera o slot antigo\n");
 }
 
@@ -302,7 +316,7 @@ static void test_pad_11_read_state_filter(void) {
     assert(x360_pad_inject_filter_read_state(&p, true, 0x57u, &packet, &gp) == 0u);
     assert(gp.buttons == (uint16_t)(0x1000u | 0x0001u | 0x0400u)); /* com Guide */
     assert(gp.left_trigger == 200u && gp.right_trigger == 10u);
-    assert(gp.thumb_lx == 1000 && gp.thumb_ly == -2000 && gp.thumb_rx == 3000 && gp.thumb_ry == -4000);
+    assert(gp.thumb_lx == 0 && gp.thumb_ly == 0 && gp.thumb_rx == 0 && gp.thumb_ry == 0);
     assert(packet == 1u);
 
     /* Novo publish: o pacote sobe e o estado acompanha; PS solto tira o Guide. */
@@ -316,6 +330,43 @@ static void test_pad_11_read_state_filter(void) {
     assert(x360_pad_inject_filter_read_state(&p, true, 0x57u, &packet, &gp) == 0x57u);
     assert(same(&e.slots[0], &OFFICIAL) && e.writes[0] == 0);
     printf("[PASS] PAD-11 read_state: ultimo estado publicado, com Guide, so para o DS4 ativo\n");
+}
+
+static void test_pad_14_held_direction_is_one_packet(void) {
+    env_t e; x360_pad_inject_t p;
+    env_init(&e, &p, true);
+    x360_gamepad_state_t gp;
+    uint32_t packet = 0u;
+    x360_gamepad_state_t held = DS4_STATE;
+    x360_gamepad_state_t pushed;
+
+    assert(x360_pad_inject_publish(&p, true, 2u, &held, false));
+    assert(x360_pad_inject_filter_read_state(&p, true, 0x57u, &packet, &gp) == 0u);
+    assert(packet == 1u && e.writes[1] == 1);
+
+    /* Quatro leituras com a seta ainda apertada e o analógico tremendo no centro. */
+    held.thumb_lx = 400;
+    held.thumb_ly = -900;
+    assert(x360_pad_inject_publish(&p, true, 2u, &held, false));
+    held.thumb_lx = -200;
+    assert(x360_pad_inject_publish(&p, true, 2u, &held, false));
+    assert(x360_pad_inject_publish(&p, true, 2u, &DS4_STATE, false));
+    assert(x360_pad_inject_publish(&p, true, 2u, &DS4_STATE, false));
+    assert(x360_pad_inject_filter_read_state(&p, true, 0x57u, &packet, &gp) == 0u);
+    assert(packet == 1u && e.writes[1] == 1);
+    assert(gp.buttons == (X360_BTN_A | X360_BTN_DPAD_UP));
+
+    /* Analógico de verdade passa da zona e anda o pacote uma vez. */
+    pushed = DS4_STATE;
+    pushed.buttons = X360_BTN_A;
+    pushed.thumb_ly = 20000;
+    pushed.thumb_lx = 0;
+    assert(x360_pad_inject_publish(&p, true, 2u, &pushed, false));
+    assert(x360_pad_inject_filter_read_state(&p, true, 0x57u, &packet, &gp) == 0u);
+    assert(packet == 2u && e.writes[1] == 2);
+    assert(gp.thumb_ly > 14000 && gp.thumb_ly < 18000);
+    assert(gp.thumb_lx == 0);
+    printf("[PASS] PAD-14 seta segurada e um pacote; zona morta come o centro\n");
 }
 
 static void test_pad_12_bind_verdict_and_context(void) {
@@ -415,11 +466,14 @@ static void test_ppc_02_install_plain_function(void) {
     assert(fn[4] == 0xAAAAAAAAu && fn[5] == 0xBBBBBBBBu);
     assert(d.original[0] == 0x7D8802A6u && d.original[3] == 0x7C9C2378u);
     /* Trampolim: as 4 instrucoes originais e o retorno para fn + 16 (0x80130540). */
-    assert(used == 4u + 6u);
+    assert(used == 4u + 10u);
     assert(tramp[0] == 0x7D8802A6u && tramp[1] == 0x9421FFC0u);
     assert(tramp[2] == 0x7C7B1B78u && tramp[3] == 0x7C9C2378u);
-    assert(tramp[4] == 0xF801FFD0u && tramp[5] == 0x3C008013u && tramp[6] == 0x60000540u);
-    assert(tramp[7] == 0x7C0903A6u && tramp[8] == 0xE801FFD0u && tramp[9] == 0x4E800420u);
+    /* Retorno por LR: guarda o CTR, nao o consome. */
+    assert(tramp[4] == 0xF801FFC8u && tramp[5] == 0x7C0902A6u && tramp[6] == 0xF801FFD0u);
+    assert(tramp[7] == 0x3C008013u && tramp[8] == 0x60000540u && tramp[9] == 0x7C0803A6u);
+    assert(tramp[10] == 0xE801FFD0u && tramp[11] == 0x7C0903A6u && tramp[12] == 0xE801FFC8u);
+    assert(tramp[13] == 0x4E800020u);
     assert(d.trampoline_addr == 0x91450000u && d.installed);
     /* Segunda instalacao no mesmo desvio e recusada. */
     assert(!ppc_detour_install(&d, fn, 0x80130530u, 0x914412A0u, tramp, 0x91450000u,
@@ -439,7 +493,7 @@ static void test_ppc_03_relocates_relative_branches(void) {
 
     assert(ppc_detour_install(&d, fn, base, 0x91441000u, tramp, 0x91450000u,
                               PPC_DETOUR_TRAMPOLINE_WORDS, &used, NULL));
-    assert(used == 1u + 6u + 6u + 6u + 6u);
+    assert(used == 1u + 6u + 6u + 6u + 10u);
     assert(tramp[0] == 0x7C0802A6u);
     /* bl base+4+0x100 = 0x80130634 -> far branch ligado (bctrl). */
     assert(tramp[1] == 0xF801FFD0u && tramp[2] == 0x3C008013u && tramp[3] == 0x60000634u);
@@ -450,8 +504,8 @@ static void test_ppc_03_relocates_relative_branches(void) {
     /* b base+12-8 = 0x80130534 -> bctr. */
     assert(tramp[13] == 0xF801FFD0u && tramp[14] == 0x3C008013u && tramp[15] == 0x60000534u);
     assert(tramp[16] == 0x7C0903A6u && tramp[17] == 0xE801FFD0u && tramp[18] == 0x4E800420u);
-    /* Retorno para base + 16 = 0x80130540. */
-    assert(tramp[21] == 0x60000540u);
+    /* Retorno para base + 16 = 0x80130540, sem gastar o CTR. */
+    assert(tramp[22] == 0x3C008013u && tramp[23] == 0x60000540u && tramp[28] == 0x4E800020u);
     printf("[PASS] PPC-03 b, bl e bc relativos sao realocados para saltos absolutos\n");
 }
 
@@ -496,7 +550,14 @@ static void test_ppc_04_install_guards(void) {
     assert(!ppc_detour_install(&d, NULL, 0u, 0u, tramp, 0u, PPC_DETOUR_TRAMPOLINE_WORDS, NULL, NULL));
     assert(!ppc_detour_install(&d, fn, 0u, 0u, NULL, 0u, PPC_DETOUR_TRAMPOLINE_WORDS, NULL, NULL));
     assert(!ppc_detour_install(&d, fn, 0u, 0u, tramp, 0u, PPC_DETOUR_TRAMPOLINE_WORDS - 1u, NULL, NULL));
-    assert(fn[0] == 1u && fn[3] == 4u && !d.installed); /* nada escrito em caso de recusa */
+    /* Thunk curto do teclado: lis / lwz / mtctr / bctr, sem mflr. Nao desvia. */
+    fn[0] = 0x3D60800Eu;
+    fn[1] = 0x816B0000u;
+    fn[2] = 0x7D6903A6u;
+    fn[3] = 0x4E800420u;
+    assert(!ppc_detour_install(&d, fn, 0x816F4AB8u, 0x91441000u, tramp, 0x91450000u,
+                               PPC_DETOUR_TRAMPOLINE_WORDS, NULL, NULL));
+    assert(fn[0] == 0x3D60800Eu && fn[3] == 0x4E800420u && !d.installed);
     printf("[PASS] PPC-04 argumentos invalidos ou trampolim pequeno nao tocam a funcao\n");
 }
 
@@ -514,6 +575,7 @@ int main(void) {
     test_pad_11_read_state_filter();
     test_pad_12_bind_verdict_and_context();
     test_pad_13_context_rule();
+    test_pad_14_held_direction_is_one_packet();
     test_guide_keystroke();
     test_ppc_01_far_branch_encoding();
     test_ppc_02_install_plain_function();

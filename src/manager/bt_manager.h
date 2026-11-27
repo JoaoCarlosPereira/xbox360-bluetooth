@@ -14,6 +14,7 @@ extern "C" {
 #define BT_IPC_MAGIC             0x42543336u /* "BT36" */
 #define BT_IPC_VERSION           1u
 #define BT_MAX_ACTIVE_SLOTS      4u
+#define BT_MAX_ACTIVE_BT_LINKS   2u
 #define BT_MAX_PAIRED_DEVICES    8u
 #define BT_MAX_SCAN_ITEMS        16u
 #define BT_SCAN_FILE_MAGIC       0x42544331u /* "BTC1" */
@@ -67,8 +68,9 @@ typedef struct {
 
     /* Dongle status */
     bool               dongle_ready;
-    uint8_t            pad_link; /* BT_LINK_*: desconectado, conectando, conectado */
-    uint8_t            live_player;     /* 1..4 do controle com o link aberto; 0 se nenhum */
+    uint8_t            pad_link; /* BT_LINK_*: algum link aberto, para o texto geral */
+    uint8_t            live_player;     /* primeiro jogador com link aberto; 0 se nenhum */
+    uint8_t            player_link[4];  /* BT_LINK_* do jogador 1..4 */
     uint8_t            identify_player; /* 1..4 enquanto SHARE esta preso nesse controle */
     uint16_t           dongle_vid;
     uint16_t           dongle_pid;
@@ -109,6 +111,7 @@ typedef enum {
 typedef struct {
     bt_ui_pane_t pane;
     int          cursor;
+    int          cursor_by_pane[3]; /* memoria de foco por aba */
     bool         content_focused; /* false: menu vertical; true: painel da direita */
     bool         exit_requested;
     bool         identify_mode; /* LB: SHARE no controle acende o card do jogador */
@@ -133,9 +136,17 @@ int bt_manager_store_single_ds4(bt_ipc_state_t *ipc, const uint8_t bd_addr[6],
 
 /* Quantos enderecos validos estao gravados. */
 int bt_manager_paired_count(const bt_ipc_state_t *ipc);
+/* Quantos links Bluetooth estao ativos (conectados ou conectando), maximo 2. */
+int bt_manager_active_bt_count(const bt_ipc_state_t *ipc);
 
 /* Move o endereco para o jogador 1..4. Se outro controle ocupa esse jogador, os dois trocam. */
 int bt_manager_set_player(bt_ipc_state_t *ipc, const uint8_t bd_addr[6], uint8_t player);
+
+/* Dois links no reply de 32 bytes: jogador no nibble, estado nos 2 bits. */
+void bt_manager_pack_links(uint8_t *player_byte, uint8_t *link_byte,
+                           uint8_t player_a, uint8_t link_a,
+                           uint8_t player_b, uint8_t link_b);
+void bt_manager_apply_links(bt_ipc_state_t *ipc, uint8_t player_byte, uint8_t link_byte);
 
 /* Resposta positiva de link key (HCI 0x040B) para o endereco gravado.
  * Retorna o tamanho do comando escrito em out_buf, ou 0 se bd_addr nao esta gravado. */
@@ -165,8 +176,12 @@ size_t bt_scan_pack(uint8_t *dst, size_t cap, const hci_inquiry_item_t *items,
                     uint32_t count, bool scanning);
 bool bt_scan_apply(bt_ipc_state_t *ipc, const uint8_t *src, size_t len);
 
+/* Uma busca nova zera o arquivo. O controle ja gravado continua na lista. */
+void bt_manager_keep_stored_in_scan(bt_ipc_state_t *ipc);
+
 /* UI navigation & command dispatch */
 void bt_ui_model_init(bt_ui_model_t *m);
+void bt_ui_model_select_initial_pane(bt_ui_model_t *m, const bt_ipc_state_t *ipc);
 void bt_ui_handle_input(bt_ui_model_t *m, bt_ipc_state_t *ipc, uint16_t newly_pressed_buttons);
 void bt_ipc_issue_cmd(bt_ipc_state_t *ipc, bt_ipc_cmd_t cmd,
                       const uint8_t *bd_addr, uint32_t slot);

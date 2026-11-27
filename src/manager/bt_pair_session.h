@@ -2,7 +2,7 @@
 #define BT_PAIR_SESSION_H
 
 /*
- * Sessao de pareamento/reconexao de um unico DualShock 4 (tarefa 06).
+ * Sessao de pareamento e de dois DualShock 4 ao vivo.
  *
  * Logica pura: nao conhece USB, arquivos nem a API do Xbox. Tudo o que toca o
  * mundo exterior passa por bt_pair_ops_t, entao os mesmos fluxos rodam no host
@@ -65,6 +65,20 @@ typedef enum {
 #define BT_PAIR_SETUP_SCAN        0x08u
 #define BT_PAIR_SETUP_ALL         0x0Fu
 
+/* Segundo DS4 no mesmo rádio. O primeiro continua nos campos da sessão. */
+typedef struct {
+    bool            active;
+    bt_pair_state_t state;
+    uint8_t         peer[6];
+    uint8_t         player;
+    uint16_t        acl_handle;
+    bool            established;
+    bool            encrypted;
+    bool            incoming;
+    bool            retry_armed;
+    uint64_t        retry_at_ms;
+} bt_pair_second_t;
+
 typedef struct {
     bt_pair_ops_t   ops;
     bt_ipc_state_t *ipc;
@@ -97,10 +111,14 @@ typedef struct {
     bool            encrypted;       /* Encryption Change ok; so entao abre o HID */
 
     bool            retry_armed;
+    uint8_t         stored_turn;     /* qual gravado paginar depois de um timeout */
+    uint16_t        orphan_handle;   /* handle de uma página que falhou e o rádio ainda segura */
     bool            user_held;       /* o jogador pediu desconectar; nao repagina sozinho */
+    bool            scan_hold;       /* solta o ACL ligado e só então abre a busca */
     uint64_t        retry_at_ms;
     uint64_t        last_second_ms;
     bool            second_notified;
+    bt_pair_second_t second;
 } bt_pair_session_t;
 
 void bt_pair_session_init(bt_pair_session_t *s, bt_ipc_state_t *ipc, const bt_pair_ops_t *ops);

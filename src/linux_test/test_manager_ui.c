@@ -266,11 +266,32 @@ static void test_slots_and_ui_ipc(void) {
     bt_ui_handle_input(&ui, &ipc, X360_BTN_X);
     assert(ipc.cmd == BT_IPC_CMD_DISCONNECT_SLOT && ipc.cmd_slot == 0);
 
-    /* Press B -> exit */
+    /* Press B inside content -> returns to left rail; second B -> exit */
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_B);
+    assert(!ui.content_focused && !ui.exit_requested);
     bt_ui_handle_input(&ui, &ipc, X360_BTN_B);
     assert(ui.exit_requested);
 
     printf("[PASS] 4-player slot manager & NXE UI navigation/IPC commands\n");
+}
+
+static void test_forget_removes_the_card(void) {
+    bt_ipc_state_t ipc;
+    bt_ipc_init(&ipc);
+    static const uint8_t addr[6] = { 1, 2, 3, 4, 5, 6 };
+    static const uint8_t key[16] = { 9 };
+    assert(bt_manager_store_single_ds4(&ipc, addr, key, 0, 2u, "DualShock 4") >= 0);
+    bt_ui_model_t ui;
+    bt_ui_model_init(&ui);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_UP);
+    assert(ui.pane == BT_UI_PANE_PAIRED);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_RIGHT);
+    assert(ui.content_focused && ui.cursor == 0);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_X);
+    assert(ipc.cmd == BT_IPC_CMD_FORGET_PAIRED);
+    assert(memcmp(ipc.cmd_bd_addr, addr, 6u) == 0);
+    assert(bt_manager_paired_count(&ipc) == 0);
+    printf("[PASS] X tira o controle da lista na hora\n");
 }
 
 static void test_dpad_follows_the_screen(void) {
@@ -351,34 +372,30 @@ static void test_first_pairing_requests_pair_and_connect(void) {
     bt_ui_model_init(&ui);
     assert(ui.pane == BT_UI_PANE_SCAN && !ui.content_focused);
 
-    /* Menu focado: A na aba Buscar nao envia comando e nao mexe na navegacao. */
+    /* Menu focado: A na aba Buscar entra no painel sem enviar comando. */
     bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
     assert(ipc.cmd_seq == 0u && ipc.cmd == BT_IPC_CMD_NONE);
-    assert(!ui.content_focused && ui.pane == BT_UI_PANE_SCAN);
+    assert(ui.content_focused && ui.pane == BT_UI_PANE_SCAN);
 
     /* Painel focado (lista vazia, sem DS4 gravado): A pede o primeiro pareamento. */
-    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_RIGHT);
-    assert(ui.content_focused);
     bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
     assert(ipc.cmd_seq == 1u);
     assert(ipc.cmd == BT_IPC_CMD_PAIR_AND_CONNECT);
     assert(memcmp(ipc.cmd_bd_addr, zero, 6u) == 0);
     assert(ui.content_focused);
 
-    /* Voltando ao menu (esquerda), A volta a nao enviar nada. */
+    /* Voltando ao menu (esquerda), A entra no painel sem enviar comando; X nao envia nada. */
     bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_LEFT);
     assert(!ui.content_focused);
-    bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
-    assert(ipc.cmd_seq == 1u);
-
-    /* Nas outras abas com o menu focado, A e X nao enviam nada. */
-    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_UP); /* Pareados */
-    bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
     bt_ui_handle_input(&ui, &ipc, X360_BTN_X);
-    assert(ipc.cmd_seq == 1u);
+    assert(ipc.cmd_seq == 1u && !ui.content_focused);
+
+    /* Nas outras abas com o menu focado, A entra sem enviar comando e X nao envia nada. */
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_UP); /* Pareados */
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_X);
+    assert(ipc.cmd_seq == 1u && !ui.content_focused);
     bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_UP); /* Controles */
     assert(bt_manager_assign_slot(&ipc, k_ds4_a, 0x0001u, "DS4-A") == 0);
-    bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
     bt_ui_handle_input(&ui, &ipc, X360_BTN_X);
     assert(ipc.cmd_seq == 1u && !ui.content_focused);
 
@@ -395,11 +412,9 @@ static void test_stored_ds4_does_not_offer_pairing(void) {
     bt_ui_model_t ui;
     bt_ui_model_init(&ui);
 
-    /* Aba Buscar: A com menu focado e com painel focado, com e sem item na lista. */
+    /* Aba Buscar: A com menu focado entra no painel sem enviar comando. */
     bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
-    assert(ipc.cmd_seq == 0u && ipc.cmd == BT_IPC_CMD_NONE);
-    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_RIGHT);
-    assert(ui.content_focused);
+    assert(ui.content_focused && ipc.cmd_seq == 0u && ipc.cmd == BT_IPC_CMD_NONE);
     bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
     assert(ipc.cmd_seq == 1u && ipc.cmd == BT_IPC_CMD_PAIR_AND_CONNECT);
 
@@ -515,6 +530,114 @@ static void test_scan_list_reaches_the_screen(void) {
     printf("[PASS] busca: a lista encontrada chega na tela\n");
 }
 
+/* Uma busca nova so traz o segundo controle. O primeiro gravado permanece na lista. */
+static void test_new_scan_keeps_the_stored_controller(void) {
+    bt_ipc_state_t ipc;
+    bt_ipc_init(&ipc);
+    assert(bt_manager_store_single_ds4(&ipc, k_ds4_a, k_ds4_key, 0x05, 2u, "DS4-A") >= 0);
+    hci_inquiry_item_t found;
+    memset(&found, 0, sizeof found);
+    memcpy(found.bd_addr, k_ds4_b, 6u);
+    memcpy(found.name, "DS4-B", 5);
+    found.class_of_device = 0x002508u;
+    uint8_t buf[BT_SCAN_FILE_BYTES];
+    assert(bt_scan_pack(buf, sizeof buf, &found, 1, true) == BT_SCAN_FILE_BYTES);
+    assert(bt_scan_apply(&ipc, buf, sizeof buf));
+    assert(ipc.scan_count == 1);
+    bt_manager_keep_stored_in_scan(&ipc);
+    assert(ipc.scan_count == 2);
+    assert(memcmp(ipc.scan_items[0].bd_addr, k_ds4_b, 6u) == 0);
+    assert(memcmp(ipc.scan_items[1].bd_addr, k_ds4_a, 6u) == 0);
+    bt_manager_keep_stored_in_scan(&ipc);
+    assert(ipc.scan_count == 2);
+    printf("[PASS] busca nova mantem o controle ja gravado\n");
+}
+
+static void test_two_links_reach_two_players(void) {
+    bt_ipc_state_t ipc;
+    uint8_t player = 0;
+    uint8_t link = 0;
+    bt_ipc_init(&ipc);
+    bt_manager_pack_links(&player, &link, 2u, BT_LINK_UP, 1u, BT_LINK_UP);
+    bt_manager_apply_links(&ipc, player, link);
+    assert(ipc.player_link[0] == BT_LINK_UP);
+    assert(ipc.player_link[1] == BT_LINK_UP);
+    assert(ipc.pad_link == BT_LINK_UP);
+    assert(bt_manager_active_bt_count(&ipc) == 2);
+    printf("[PASS] os dois links aparecem nos dois jogadores\n");
+}
+
+static void test_ergonomics_focus_memory_and_two_bt_limit(void) {
+    bt_ipc_state_t ipc;
+    bt_ipc_init(&ipc);
+    const uint8_t c[6] = { 3, 3, 3, 3, 3, 3 };
+    assert(bt_manager_store_single_ds4(&ipc, k_ds4_a, k_ds4_key, 0x05, 1u, "DS4-A") >= 0);
+    assert(bt_manager_store_single_ds4(&ipc, k_ds4_b, k_ds4_key, 0x05, 2u, "DS4-B") >= 0);
+    assert(bt_manager_store_single_ds4(&ipc, c, k_ds4_key, 0x05, 3u, "DS4-C") >= 0);
+    ipc.player_link[0] = BT_LINK_UP;
+    ipc.player_link[1] = BT_LINK_UP;
+    assert(bt_manager_active_bt_count(&ipc) == 2);
+
+    bt_ui_model_t ui;
+    bt_ui_model_init(&ui);
+    bt_ui_model_select_initial_pane(&ui, &ipc);
+    assert(ui.pane == BT_UI_PANE_SLOTS && !ui.content_focused);
+
+    /* A entra no painel; navega ate Jogador 4 (cursor 3); LB liga identificar;
+     * B desliga identificar, B volta ao menu, troca de aba preserva memoria de foco. */
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
+    assert(ui.content_focused && ui.cursor == 0);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_RIGHT);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_DOWN);
+    assert(ui.cursor == 3);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_LEFT_SHOULDER);
+    assert(ui.identify_mode);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_B);
+    assert(!ui.identify_mode && ui.content_focused);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_B);
+    assert(!ui.content_focused && !ui.exit_requested);
+
+    /* Vai para Pareados e volta para Controles: cursor 3 preservado. */
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_DOWN);
+    assert(ui.pane == BT_UI_PANE_PAIRED);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_UP);
+    assert(ui.pane == BT_UI_PANE_SLOTS && ui.cursor == 3);
+
+    /* Em Pareados com 2/2 BT ativos, tentar conectar o 3o (DS4-C) avisa o limite. */
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_DOWN);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_DOWN);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_DPAD_DOWN);
+    assert(ui.cursor == 2);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
+    assert(ipc.cmd_seq == 0u);
+    assert(strstr(ipc.status_msg, "Limite de 2") != NULL);
+
+    printf("[PASS] ergonomia 10-foot, memoria de foco, B hierarquico e limite 2/2 BT\n");
+}
+
+static void test_empty_player1_card_takes_the_live_controller(void) {
+    bt_ipc_state_t ipc;
+    bt_ui_model_t ui;
+    bt_ipc_init(&ipc);
+    assert(bt_manager_store_single_ds4(&ipc, k_ds4_a, k_ds4_key, 0x05, 2u, "DS4-A") >= 0);
+    assert(bt_manager_store_single_ds4(&ipc, k_ds4_b, k_ds4_key, 0x05, 3u, "DS4-B") >= 0);
+    for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
+        if (ipc.paired[i].valid && memcmp(ipc.paired[i].bd_addr, k_ds4_b, 6u) == 0)
+            ipc.paired[i].player = 2u;
+    }
+    ipc.player_link[1] = BT_LINK_UP;
+    bt_ui_model_init(&ui);
+    bt_ui_model_select_initial_pane(&ui, &ipc);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
+    assert(ui.content_focused && ui.cursor == 0);
+    bt_ui_handle_input(&ui, &ipc, X360_BTN_A);
+    assert(bt_manager_find_paired(&ipc, k_ds4_a)->player == 1u);
+    assert(bt_manager_find_paired(&ipc, k_ds4_b)->player == 2u);
+    assert(ipc.cmd == BT_IPC_CMD_SET_PLAYER && ipc.cmd_slot == 1u);
+    printf("[PASS] A no card vazio do jogador 1 leva o controle que esta no ar\n");
+}
+
 int main(void) {
     test_paired_ini_roundtrip();
     test_par05_player_roundtrip();
@@ -524,6 +647,7 @@ int main(void) {
     test_lim01_second_address_refused();
     test_par05_empty_ini_no_reply();
     test_slots_and_ui_ipc();
+    test_forget_removes_the_card();
     test_dpad_follows_the_screen();
     test_interactive_button_remap();
     test_first_pairing_requests_pair_and_connect();
@@ -531,5 +655,9 @@ int main(void) {
     test_reply_phrase_becomes_exact_text();
     test_adapter_phrase_keeps_status();
     test_scan_list_reaches_the_screen();
+    test_new_scan_keeps_the_stored_controller();
+    test_two_links_reach_two_players();
+    test_ergonomics_focus_memory_and_two_bt_limit();
+    test_empty_player1_card_takes_the_live_controller();
     return 0;
 }

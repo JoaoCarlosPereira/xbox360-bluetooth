@@ -173,6 +173,8 @@ static void run_pair_handshake(rig_t *r, uint64_t now) {
     feed(r, e, evt_auth_complete(e, 0, 0x0021u), now);
 }
 
+static size_t evt_encrypt(uint8_t *b, uint8_t status, uint16_t handle, uint8_t on);
+
 /* ---- PAR-05 / reconexao ------------------------------------------------------- */
 
 static void test_par_05_reconnect_without_inquiry(void) {
@@ -210,9 +212,12 @@ static void test_link_key_reply_with_stored_key(void) {
     assert(count_op(&r.m, HCI_OP_LINK_KEY_REQ_NEG_REPLY) == 0);
 
     feed(&r, e, evt_auth_complete(e, 0, 0x0030u), 120);
-    assert(r.s.state == BT_PAIR_CONNECTED && r.s.established);
+    assert(r.s.state == BT_PAIR_AUTH && !r.s.established);
+    assert(count_op(&r.m, HCI_OP_SET_CONN_ENCRYPT) == 0);
+    feed(&r, e, evt_encrypt(e, 0, 0x0030u, 1), 130);
+    assert(r.s.state == BT_PAIR_CONNECTED && r.s.established && r.s.encrypted);
     assert(r.s.player == 1u); /* jogador gravado volta na reconexao, sem frase nova */
-    assert(count_op(&r.m, HCI_OP_SET_CONN_ENCRYPT) == 1);
+    assert(count_op(&r.m, HCI_OP_SET_CONN_ENCRYPT) == 0);
     assert(r.m.nnotified == 0); /* reconexao nao tem frase */
     printf("[PASS] PAR-05 pedido de link key respondido com a chave gravada (0x040B)\n");
 }
@@ -537,6 +542,7 @@ static void test_err_03_disconnect_mid_session(void) {
     feed(&r, e, evt_conn_complete(e, 0, 0x0050u, ADDR_A), 1 * S);
     feed(&r, e, evt_addr_only(e, HCI_EVT_LINK_KEY_REQUEST, ADDR_A, 0), 1 * S);
     feed(&r, e, evt_auth_complete(e, 0, 0x0050u), 1 * S);
+    feed(&r, e, evt_encrypt(e, 0, 0x0050u, 1), 1 * S);
     assert(r.s.state == BT_PAIR_CONNECTED);
     r.s.phrase_id = BT_PHRASE_DS4_PAIRED_PLAYER1; /* frase antiga que a queda substitui */
     r.s.player = 1u;
@@ -580,6 +586,59 @@ static void test_adapter_lost_resets_session(void) {
     printf("[PASS] adaptador removido zera a sessao sem frase de DS4\n");
 }
 
+static void test_scan_releases_connected_ds4(void) {
+    rig_t r;
+    rig_init(&r, true);
+    bt_pair_session_adapter_ready(&r.s, 0);
+    uint8_t e[32];
+    feed(&r, e, evt_conn_complete(e, 0, 0x0030u, ADDR_A), 100);
+    feed(&r, e, evt_auth_complete(e, 0, 0x0030u), 120);
+    feed(&r, e, evt_encrypt(e, 0, 0x0030u, 1), 130);
+    assert(r.s.state == BT_PAIR_CONNECTED && r.m.inq_start == 0);
+
+    bt_pair_session_on_command(&r.s, BT_IPC_CMD_START_SCAN, NULL, 200);
+    assert(r.m.inq_start == 0);
+    assert(count_op(&r.m, HCI_OP_DISCONNECT) == 1);
+    assert(r.m.nnotified == 0);
+
+    feed(&r, e, evt_disconnect(e, 0x0030u, 0x13), 300);
+    assert(r.s.state == BT_PAIR_IDLE);
+    assert(r.m.inq_start == 1);
+    assert(r.m.nnotified == 0); /* pausa da busca não é queda do controle */
+    bt_pair_session_tick(&r.s, 300 + BT_PAIR_RECONNECT_RETRY_MS);
+    assert(count_op(&r.m, HCI_OP_CREATE_CONNECTION) == 1);
+
+    bt_pair_session_on_command(&r.s, BT_IPC_CMD_STOP_SCAN, NULL, 400);
+    assert(r.m.inq_stop == 1);
+    assert(count_op(&r.m, HCI_OP_CREATE_CONNECTION) == 2);
+    printf("[PASS] Y com o DS4 ligado solta o link, busca, e o stop religa\n");
+}
+
+static void test_scan_waits_until_both_links_drop(void) {
+    rig_t r;
+    rig_init(&r, true);
+    bt_pair_session_adapter_ready(&r.s, 0);
+    uint8_t e[32];
+    feed(&r, e, evt_conn_complete(e, 0, 0x0030u, ADDR_A), 100);
+    feed(&r, e, evt_auth_complete(e, 0, 0x0030u), 110);
+    feed(&r, e, evt_encrypt(e, 0, 0x0030u, 1), 120);
+    r.s.second.active = true;
+    r.s.second.established = true;
+    r.s.second.state = BT_PAIR_CONNECTED;
+    r.s.second.acl_handle = 0x0031u;
+    memcpy(r.s.second.peer, ADDR_B, 6u);
+
+    bt_pair_session_on_command(&r.s, BT_IPC_CMD_START_SCAN, NULL, 200);
+    assert(r.m.inq_start == 0);
+    assert(count_op(&r.m, HCI_OP_DISCONNECT) == 2);
+
+    feed(&r, e, evt_disconnect(e, 0x0030u, 0x13), 300);
+    assert(r.m.inq_start == 0);
+    feed(&r, e, evt_disconnect(e, 0x0031u, 0x13), 400);
+    assert(r.m.inq_start == 1);
+    printf("[PASS] a busca espera os dois links cairem\n");
+}
+
 static void test_pair_command_ignored_without_adapter(void) {
     rig_t r;
     rig_init(&r, false);
@@ -590,6 +649,114 @@ static void test_pair_command_ignored_without_adapter(void) {
     complete_setup(&r, 1);
     assert(r.m.inq_start == 0 && !r.s.pair_active);
     printf("[PASS] comando de parear ignorado sem adaptador; outros comandos nao abrem inquiry\n");
+}
+
+static void test_page_timeout_releases_handle(void) {
+    rig_t r;
+    uint8_t e[32];
+    rig_init(&r, true);
+    bt_pair_session_adapter_ready(&r.s, 0);
+    feed(&r, e, evt_conn_complete(e, 0x04, 0, ADDR_A), 500);
+    assert(count_op(&r.m, HCI_OP_DISCONNECT) == 0);
+    feed(&r, e, evt_conn_complete(e, 0x04, 0x0002u, ADDR_A), 1000);
+    assert(count_op(&r.m, HCI_OP_DISCONNECT) == 0);
+    assert(r.s.orphan_handle == 0x0002u);
+    assert(r.s.state == BT_PAIR_IDLE);
+    bt_pair_session_tick(&r.s, 1000 + BT_PAIR_RECONNECT_RETRY_MS);
+    assert(r.s.state == BT_PAIR_CONNECTING);
+    uint8_t st[6] = { HCI_EVT_COMMAND_STATUS, 4, 0x0B, 1, 0, 0 };
+    hci_put_le16(st + 4, HCI_OP_CREATE_CONNECTION);
+    bt_pair_session_on_event(&r.s, st, sizeof st, 1000 + BT_PAIR_RECONNECT_RETRY_MS);
+    const cmd_rec_t *d = last_op(&r.m, HCI_OP_DISCONNECT);
+    assert(d && d->len >= 2 && d->params[0] == 0x02 && d->params[1] == 0x00);
+    assert(r.s.state == BT_PAIR_IDLE);
+    printf("[PASS] timeout de pagina guarda o handle; a recusa 0x0B solta\n");
+}
+
+static void test_two_stored_stay_connected(void) {
+    rig_t r;
+    static const uint8_t key_b[16] = { 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9 };
+    uint8_t e[32];
+    rig_init(&r, true);
+    assert(bt_manager_store_single_ds4(&r.ipc, ADDR_B, key_b, 5u, 2u, "DS4B") >= 0);
+    bt_pair_session_adapter_ready(&r.s, 0);
+    feed(&r, e, evt_conn_complete(e, 0, 0x0030u, ADDR_A), 100);
+    feed(&r, e, evt_auth_complete(e, 0, 0x0030u), 110);
+    feed(&r, e, evt_encrypt(e, 0, 0x0030u, 1), 120);
+    assert(r.s.state == BT_PAIR_CONNECTED && r.s.established && r.s.acl_handle == 0x0030u);
+    assert(r.s.second.state == BT_PAIR_CONNECTING);
+    const cmd_rec_t *page = last_op(&r.m, HCI_OP_CREATE_CONNECTION);
+    assert(page && memcmp(page->params, ADDR_B, 6) == 0);
+
+    feed(&r, e, evt_conn_complete(e, 0, 0x0031u, ADDR_B), 200);
+    feed(&r, e, evt_auth_complete(e, 0, 0x0031u), 210);
+    assert(!r.s.second.established);
+    assert(count_op(&r.m, HCI_OP_SET_CONN_ENCRYPT) == 0);
+    feed(&r, e, evt_encrypt(e, 0, 0x0031u, 1), 220);
+    assert(r.s.second.established && r.s.second.player == 2u && r.s.second.acl_handle == 0x0031u);
+    assert(r.s.established && r.s.acl_handle == 0x0030u);
+    assert(count_op(&r.m, HCI_OP_DISCONNECT) == 0);
+
+    static const uint8_t phone[6] = { 7, 7, 7, 7, 7, 7 };
+    feed(&r, e, evt_conn_request(e, phone, 0x5A020Cu), 300);
+    const cmd_rec_t *rej = last_op(&r.m, HCI_OP_REJECT_CONN_REQ);
+    assert(rej && memcmp(rej->params, phone, 6) == 0);
+    assert(r.s.acl_handle == 0x0030u && r.s.second.acl_handle == 0x0031u);
+    printf("[PASS] dois DS4 gravados ficam ligados ao mesmo tempo\n");
+}
+
+static void test_page_timeout_tries_the_other_stored(void) {
+    rig_t r;
+    static const uint8_t key_b[16] = { 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9 };
+    uint8_t e[32];
+    rig_init(&r, true);
+    assert(bt_manager_store_single_ds4(&r.ipc, ADDR_B, key_b, 5u, 2u, "DS4B") >= 0);
+    bt_pair_session_adapter_ready(&r.s, 0);
+    const cmd_rec_t *first = last_op(&r.m, HCI_OP_CREATE_CONNECTION);
+    assert(first && memcmp(first->params, ADDR_A, 6) == 0);
+    feed(&r, e, evt_conn_complete(e, 0x04, 0, ADDR_A), 10 * S);
+    bt_pair_session_tick(&r.s, 10 * S + BT_PAIR_RECONNECT_RETRY_MS);
+    const cmd_rec_t *next = last_op(&r.m, HCI_OP_CREATE_CONNECTION);
+    assert(next && memcmp(next->params, ADDR_B, 6) == 0);
+    printf("[PASS] timeout de pagina chama o outro controle gravado\n");
+}
+
+static void test_page_timeout_does_not_drop_the_incoming(void) {
+    rig_t r;
+    static const uint8_t key_b[16] = { 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9 };
+    uint8_t e[32];
+    rig_init(&r, true);
+    assert(bt_manager_store_single_ds4(&r.ipc, ADDR_B, key_b, 5u, 2u, "DS4B") >= 0);
+    bt_pair_session_adapter_ready(&r.s, 0);
+    feed(&r, e, evt_conn_complete(e, 0x04, 0x0001u, ADDR_A), 1000);
+    feed(&r, e, evt_conn_request(e, ADDR_B, 0x000508u), 1010);
+    const cmd_rec_t *acc = last_op(&r.m, HCI_OP_ACCEPT_CONN_REQ);
+    assert(acc && memcmp(acc->params, ADDR_B, 6) == 0);
+    assert(count_op(&r.m, HCI_OP_DISCONNECT) == 0);
+    feed(&r, e, evt_conn_complete(e, 0, 0x0001u, ADDR_B), 1020);
+    assert(r.s.second.state == BT_PAIR_AUTH && r.s.second.acl_handle == 0x0001u);
+    assert(r.s.orphan_handle != 0x0001u);
+    assert(count_op(&r.m, HCI_OP_DISCONNECT) == 0);
+    printf("[PASS] timeout de pagina nao derruba o controle que entra\n");
+}
+
+static void test_retry_skips_the_controller_already_up(void) {
+    rig_t r;
+    static const uint8_t key_b[16] = { 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9 };
+    uint8_t e[32];
+    rig_init(&r, true);
+    assert(bt_manager_store_single_ds4(&r.ipc, ADDR_B, key_b, 5u, 2u, "DS4B") >= 0);
+    bt_pair_session_adapter_ready(&r.s, 0);
+    feed(&r, e, evt_conn_complete(e, 0x04, 0, ADDR_A), 1000);
+    r.s.second.established = true;
+    r.s.second.active = true;
+    r.s.second.state = BT_PAIR_CONNECTED;
+    memcpy(r.s.second.peer, ADDR_B, 6u);
+    r.s.stored_turn = 1;
+    bt_pair_session_tick(&r.s, 1000 + BT_PAIR_RECONNECT_RETRY_MS);
+    const cmd_rec_t *page = last_op(&r.m, HCI_OP_CREATE_CONNECTION);
+    assert(page && memcmp(page->params, ADDR_A, 6) == 0);
+    printf("[PASS] a nova tentativa nao chama o controle que ja esta ligado\n");
 }
 
 int main(void) {
@@ -608,8 +775,15 @@ int main(void) {
     test_par_03_second_ds4();
     test_same_address_is_not_second_ds4();
     test_incoming_connection_requests();
+    test_page_timeout_releases_handle();
+    test_two_stored_stay_connected();
+    test_page_timeout_tries_the_other_stored();
+    test_page_timeout_does_not_drop_the_incoming();
+    test_retry_skips_the_controller_already_up();
     test_err_03_disconnect_mid_session();
     test_adapter_lost_resets_session();
+    test_scan_releases_connected_ds4();
+    test_scan_waits_until_both_links_drop();
     test_pair_command_ignored_without_adapter();
     return 0;
 }

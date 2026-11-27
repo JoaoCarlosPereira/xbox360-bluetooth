@@ -20,9 +20,9 @@ typedef struct {
     int32_t usb_status;
     uint32_t adapter_stage;
     uint32_t phrase_id;   /* bt_phase1_phrase_id_t (tabela unica em bt_phase1.h) */
-    uint8_t player;       /* 0 = nenhum, 1 ou 2 */
+    uint8_t player;       /* nibble baixo: jogador do 1o link; nibble alto: o 2o */
     uint8_t pair_active;  /* 0 = falso, 1 = pareamento ativo */
-    uint8_t link;         /* BT_LINK_DOWN, BT_LINK_CONNECTING ou BT_LINK_UP */
+    uint8_t link;         /* bits 0-1: estado do 1o; bits 2-3: estado do 2o */
     uint8_t reserved;
 } bt_console_reply_t;
 

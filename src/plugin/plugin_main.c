@@ -53,103 +53,19 @@ static void sleep_ms(uint32_t ms) {
     KeDelayExecutionThread(0, 0, &interval);
 }
 
-/* xam.xex export 656; call shape copied from hiddriver360 main.cpp:42.
- * Tipo 0 é o orbe do Xbox com o texto livre. Tipo 3 é o aviso de carta.
- * Tipo 0x2F é a faixa da foto (tempo de jogo), mas o sistema troca o texto
- * pela frase de horas, então o aviso do controle não usa esse tipo.
- * A área 1 aparece no painel e a 2 dentro do jogo. */
-#define XAM_ORD_XNOTIFY_QUEUE_UI 656u
-#define XNOTIFY_UI_TYPE          3u
-#define XNOTIFY_UI_XBOX_LOGO     0u
-#define XNOTIFY_AREA_BOTH        3ull
-#define XNOTIFY_USER_ANY         0x000000FFu
+/* A faixa é do XNotify, numa thread curta de título. O arquivo fica só como cópia.
+ * A thread que pagina o controle não chama o XAM. */
 #define ADAPTER_NOT_FOUND_TICKS  150u /* 15 s of 100 ms polls without the UGREEN */
 #define AURORA_SETTLE_TICKS      150u /* 15 s with Aurora as the running title */
+#define NOTICE_FILE "\\Device\\Mass0\\bt360_notice.txt"
 
-typedef void (*xnotify_queue_ui_fn)(uint32_t type, uint32_t user_index, uint64_t areas,
-                                    const uint16_t *text, void *context);
-
-static xnotify_queue_ui_fn xnotify_queue_ui;
-static bool xnotify_resolved;
-
-/* Phrase tables are UTF-8; XNotifyQueueUI wants big-endian UTF-16 (native here). */
-static size_t utf8_to_utf16(const char *src, uint16_t *dst, size_t capacity) {
-    size_t n = 0;
-    const uint8_t *p = (const uint8_t *)src;
-    while (*p && n + 1 < capacity) {
-        uint32_t c = *p++;
-        if (c >= 0xC0u && c < 0xE0u && (*p & 0xC0u) == 0x80u) {
-            c = ((c & 0x1Fu) << 6) | (*p++ & 0x3Fu);
-        } else if (c >= 0x80u) {
-            c = '?';
-        }
-        dst[n++] = (uint16_t)c;
-    }
-    dst[n] = 0;
-    return n;
-}
-
-/* O DashLaunch chama o plugin numa thread de sistema, e o XAM descarta
- * XNotifyQueueUI vindo de lá. O aviso sai numa thread comum. */
-static uint16_t g_note_wide[96];
-static uint32_t g_note_type;
-static volatile uint32_t g_note_state;
-static bool g_note_thread;
-
-static uint32_t notify_worker(void *unused) {
-    (void)unused;
-    for (;;) {
-        if (g_note_state == 1u && xnotify_queue_ui) {
-            uint16_t local[96];
-            const uint32_t type = g_note_type;
-            memcpy(local, g_note_wide, sizeof local);
-            g_note_state = 0u;
-            xnotify_queue_ui(type, XNOTIFY_USER_ANY, XNOTIFY_AREA_BOTH, local, NULL);
-        }
-        sleep_ms(20);
-    }
-    return 0;
-}
-
-static void notify_thread_start(void) {
-    HANDLE thread = 0;
-    uint32_t id = 0;
-    if (g_note_thread) return;
-    const NTSTATUS status = ExCreateThread(&thread, 0, &id, NULL, (void *)notify_worker, NULL, 0);
-    g_note_thread = NT_SUCCESS(status);
-    xsdk_plugin_log("notify: thread status=0x%08X", (unsigned)status);
-}
-
-static void notify_text(const char *text, uint32_t type) {
-    unsigned wait;
-    if (!text) return;
-    if (!xnotify_resolved) {
-        HANDLE xam = 0;
-        xnotify_resolved = true;
-        if (XexGetModuleHandle("xam.xex", &xam) == 0 && xam) {
-            void *fn = NULL;
-            if (NT_SUCCESS(XexGetProcedureAddress(xam, XAM_ORD_XNOTIFY_QUEUE_UI, &fn)))
-                xnotify_queue_ui = (xnotify_queue_ui_fn)fn;
-        }
-    }
-    if (!xnotify_queue_ui) {
-        xsdk_plugin_log("notify=absent");
-        return;
-    }
-    notify_thread_start();
-    for (wait = 0; g_note_state == 1u && wait < 20u; wait++) sleep_ms(10);
-    utf8_to_utf16(text, g_note_wide, sizeof g_note_wide / sizeof g_note_wide[0]);
-    g_note_type = type;
-    if (g_note_thread) {
-        g_note_state = 1u;
-    } else {
-        xnotify_queue_ui(type, XNOTIFY_USER_ANY, XNOTIFY_AREA_BOTH, g_note_wide, NULL);
-    }
-    xsdk_plugin_log("notify: queued type=%u", type);
-}
+static void notice_write(const char *text);
+static bool notify_system(const char *text);
 
 static void notify_phrase(uint32_t phrase_id) {
-    notify_text(bt_phase1_phrase_text(phrase_id), XNOTIFY_UI_TYPE);
+    const char *text = bt_phase1_phrase_text(phrase_id);
+    xsdk_plugin_log("notify: phrase %u", (unsigned)phrase_id);
+    if (text) notify_system(text);
 }
 
 /* ---- Pairing session wiring (tarefa 06) ------------------------------------ */
@@ -167,25 +83,30 @@ typedef uint32_t (*xam_input_get_state_fn)(uint32_t user_index, uint32_t flags, 
 static bt_ipc_state_t   g_ipc;
 static bt_pair_session_t g_session;
 
-/* Faixa com o orbe do Xbox quando o DualShock entra ou sai. */
-static void notify_link_edge(void) {
-    const bool up = g_session.state == BT_PAIR_CONNECTED && g_session.established;
-    static bool was_up;
+static void notify_pad_edge(bool up, uint8_t player, bool *was_up) {
     char text[64];
-    if (up == was_up) return;
-    was_up = up;
-    if (up && g_session.player >= 1u && g_session.player <= 4u) {
-        static const char prefix[] = "DualShock 4\nConectado no Jogador ";
+    if (!was_up || up == *was_up) return;
+    if (up && player >= 1u && player <= 4u) {
+        static const char prefix[] = "DualShock 4 / Conectado no Jogador ";
         memcpy(text, prefix, sizeof prefix - 1u);
-        text[sizeof prefix - 1u] = (char)('0' + g_session.player);
+        text[sizeof prefix - 1u] = (char)('0' + player);
         text[sizeof prefix] = '.';
         text[sizeof prefix + 1u] = '\0';
     } else if (up) {
-        memcpy(text, "DualShock 4\nConectado.", sizeof "DualShock 4\nConectado.");
+        memcpy(text, "DualShock 4 / Conectado.", sizeof "DualShock 4 / Conectado.");
     } else {
-        memcpy(text, "DualShock 4\nDesconectado.", sizeof "DualShock 4\nDesconectado.");
+        memcpy(text, "DualShock 4 desconectado.", sizeof "DualShock 4 desconectado.");
     }
-    notify_text(text, XNOTIFY_UI_XBOX_LOGO);
+    if (notify_system(text)) *was_up = up;
+}
+
+/* Faixa quando cada DualShock entra ou sai. */
+static void notify_link_edge(void) {
+    static bool was_up;
+    static bool was_second;
+    notify_pad_edge(g_session.state == BT_PAIR_CONNECTED && g_session.established,
+                    g_session.player, &was_up);
+    notify_pad_edge(g_session.second.established, g_session.second.player, &was_second);
 }
 static char             g_ini[INI_CAPACITY];
 static uint8_t          g_event[HCI_MAX_EVT_SIZE];
@@ -219,6 +140,33 @@ static bool ini_transfer(const char *path, uint16_t path_size, void *input_out, 
     const bool ok = NT_SUCCESS(status);
     NtClose(file);
     return ok;
+}
+
+/* Uma linha: 8 dígitos, espaço, texto. A Aurora mostra e o plugin segue. */
+static uint32_t g_notice_seq;
+
+static void notice_write(const char *text) {
+    char buf[160];
+    size_t i = 9u;
+    size_t n;
+    uint32_t seq;
+    if (!text || !text[0]) return;
+    seq = ++g_notice_seq;
+    for (int d = 7; d >= 0; d--) {
+        buf[d] = (char)('0' + (seq % 10u));
+        seq /= 10u;
+    }
+    buf[8] = ' ';
+    while (text[0] && i + 2u < sizeof buf) {
+        buf[i++] = text[0] == '\n' ? ' ' : text[0];
+        text++;
+    }
+    buf[i++] = '\n';
+    n = i;
+    if (ini_transfer(NOTICE_FILE, sizeof NOTICE_FILE, buf, &n, true))
+        xsdk_plugin_log("notify: aurora notice %u", (unsigned)g_notice_seq);
+    else
+        xsdk_plugin_log("notify: aurora notice failed status=0x%08X", (unsigned)g_ini_status);
 }
 
 /* Loads Mass0:\bt_devices.ini once. Returns true once the volume answered. */
@@ -320,6 +268,264 @@ static uint64_t now_ms(void) {
     return t / 10000u;
 }
 
+/* Faixa do sistema, como o XNotify Tweaks: thread de título, ícone 34.
+ * XapiThreadStartup quando o xam entrega o endereço. Sem ele, a mesma flag
+ * TITLE_EXEC do código publicado. Sem flag de sistema, sem tipo 3, sem 0x2F. */
+#define NOTICE_TYPE_EXCLAIM        34u
+#define NOTICE_USER_ANY            0xFFu
+#define NOTICE_AREA_SYSTEM         1ull
+#define NOTICE_SYSTEM              0x2u
+#define NOTICE_TITLE_EXEC          0x100u
+#define NOTICE_RETURN_KTHREAD      0x80u
+#define NOTICE_STACK               (64u * 1024u)
+#define NOTICE_WAIT_MS             5000u
+#define XAM_ORD_NOTIFY_QUEUE_UI    656u
+#define XAM_ORD_LOADER_GET_STATE   1191u
+#define XAM_ORD_CREATE_THREAD      0x43Cu
+#define XAM_ORD_XAPIP_CREATE_THREAD 0x45Cu
+#define KRNL_ORD_PROCESS_TYPE      102u
+#define LOADER_TITLE_RUNNING       5u
+#define PROC_USER                  1u
+
+typedef void (*xnotify_queue_ui_fn)(uint32_t type, uint32_t user, uint64_t areas,
+                                    const uint16_t *text, void *context);
+typedef uint32_t (*xam_dword_fn)(void);
+
+/* Símbolo do XDK. O xsdk não o liga; se o linker não tiver, fica nulo. */
+extern void XapiThreadStartup(void *start, void *context) __attribute__((weak));
+
+static xnotify_queue_ui_fn g_queue_ui;
+static xam_dword_fn        g_loader_state;
+static xam_dword_fn        g_process_type;
+static void               *g_xapi_startup;
+static volatile uint32_t   g_notify_result;
+static volatile bool       g_notify_busy;
+static bool                g_notify_worker_up;
+static bool                g_notify_stuck;
+static bool                g_notify_logged_unavailable;
+static bool                g_notify_ready;
+static uint16_t            g_notice_wide[96];
+
+static bool read_u32(uint32_t addr, uint32_t *out) {
+    if ((addr & 3u) != 0u) return false;
+    if (!MmIsAddressValid((const void *)(uintptr_t)addr)) return false;
+    if (!MmIsAddressValid((const uint8_t *)(uintptr_t)addr + 3u)) return false;
+    memcpy(out, (const void *)(uintptr_t)addr, sizeof *out);
+    return true;
+}
+
+static void *resolve_ordinal(const char *module_name, uint32_t ordinal) {
+    HANDLE module = 0;
+    void *fn = NULL;
+    if (XexGetModuleHandle(module_name, &module) != 0 || !module) return NULL;
+    if (!NT_SUCCESS(XexGetProcedureAddress(module, ordinal, &fn)) || !fn) return NULL;
+    if (!MmIsAddressValid(fn)) return NULL;
+    return fn;
+}
+
+/* lis r6,hi + addi/ori r6,r6,lo vira o endereço passado no 4º argumento. */
+static uint32_t ppc_r6_address(uint32_t lis, uint32_t next) {
+    const uint32_t hi = lis & 0xFFFFu;
+    const uint32_t op = next >> 26;
+    const uint32_t rs = (next >> 21) & 31u;
+    const uint32_t ra = (next >> 16) & 31u;
+    const uint32_t lo = next & 0xFFFFu;
+    if ((lis >> 26) != 15u || ((lis >> 21) & 31u) != 6u) return 0;
+    if (op == 14u && rs == 6u && ra == 6u)
+        return (hi << 16) + (uint32_t)(int32_t)(int16_t)lo;
+    if (op == 24u && rs == 6u && ra == 6u)
+        return (hi << 16) | lo;
+    return 0;
+}
+
+static bool prologue_ok(uint32_t first) {
+    /* stwu r1, d(r1) ou mflr r12: prólogo de função, não um dado. */
+    return (first & 0xFFFF0000u) == 0x94210000u || first == 0x7D8802A6u;
+}
+
+/* O CreateThread do xam passa XapiThreadStartup no r6 antes de chamar o kernel.
+ * Um candidato só, dentro da imagem, com prólogo. Vários ou nenhum: não usa. */
+static void *startup_from_creator(void *creator, uint32_t image_base, uint32_t image_size) {
+    const uint32_t start = (uint32_t)(uintptr_t)creator;
+    uint32_t found = 0;
+    unsigned hits = 0;
+    if (!creator || image_size < 8u || start < image_base || start >= image_base + image_size)
+        return NULL;
+    for (unsigned i = 0; i < 192u; i++) {
+        uint32_t word = 0;
+        uint32_t next = 0;
+        const uint32_t addr = start + i * 4u;
+        if (!read_u32(addr, &word)) break;
+        if (word == 0x4E800020u) break;
+        if ((word >> 26) != 15u || !read_u32(addr + 4u, &next)) continue;
+        const uint32_t target = ppc_r6_address(word, next);
+        uint32_t first = 0;
+        bool calls = false;
+        if (target < image_base || target + 4u > image_base + image_size) continue;
+        if ((target & 3u) != 0u || target == start) continue;
+        if (!read_u32(target, &first) || !prologue_ok(first)) continue;
+        for (unsigned j = i + 2u; j < i + 12u && j < 192u; j++) {
+            uint32_t branch = 0;
+            if (!read_u32(start + j * 4u, &branch)) break;
+            if (branch == 0x4E800020u) break;
+            if ((branch >> 26) == 18u && (branch & 1u) != 0u) {
+                calls = true;
+                break;
+            }
+        }
+        if (!calls) continue;
+        hits++;
+        found = target;
+    }
+    if (hits != 1u) {
+        xsdk_plugin_log("notify: startup scan hits=%u", hits);
+        return NULL;
+    }
+    return (void *)(uintptr_t)found;
+}
+
+static void *find_xapi_startup(void) {
+    void *linked = (void *)XapiThreadStartup;
+    HANDLE xam = 0;
+    const LDR_DATA_TABLE_ENTRY *ldr;
+    void *from_xapip;
+    void *from_create;
+    if (linked) return linked;
+    if (XexGetModuleHandle("xam.xex", &xam) != 0 || !xam) return NULL;
+    if (!MmIsAddressValid((const void *)(uintptr_t)xam)) return NULL;
+    ldr = (const LDR_DATA_TABLE_ENTRY *)(uintptr_t)xam;
+    if (ldr->image_base == 0u || ldr->image_size < 8u) return NULL;
+    from_xapip = startup_from_creator(resolve_ordinal("xam.xex", XAM_ORD_XAPIP_CREATE_THREAD),
+                                      ldr->image_base, ldr->image_size);
+    if (from_xapip) return from_xapip;
+    from_create = startup_from_creator(resolve_ordinal("xam.xex", XAM_ORD_CREATE_THREAD),
+                                       ldr->image_base, ldr->image_size);
+    return from_create;
+}
+
+static void utf8_to_wide(const char *in, uint16_t *out, size_t cap) {
+    size_t o = 0;
+    if (cap == 0u) return;
+    while (in[0] != '\0' && o + 1u < cap) {
+        const uint8_t c = (uint8_t)in[0];
+        uint32_t cp;
+        if (c < 0x80u) {
+            cp = c;
+            in += 1;
+        } else if ((c & 0xE0u) == 0xC0u && ((uint8_t)in[1] & 0xC0u) == 0x80u) {
+            cp = ((uint32_t)(c & 0x1Fu) << 6) | ((uint8_t)in[1] & 0x3Fu);
+            in += 2;
+        } else if ((c & 0xF0u) == 0xE0u && ((uint8_t)in[1] & 0xC0u) == 0x80u &&
+                   ((uint8_t)in[2] & 0xC0u) == 0x80u) {
+            cp = ((uint32_t)(c & 0x0Fu) << 12) | ((uint32_t)((uint8_t)in[1] & 0x3Fu) << 6) |
+                 ((uint8_t)in[2] & 0x3Fu);
+            in += 3;
+        } else {
+            cp = '?';
+            in += 1;
+        }
+        if (cp > 0xFFFFu) cp = '?';
+        out[o++] = (uint16_t)cp;
+    }
+    out[o] = 0;
+}
+
+/* Só o XNotify. Sem página do controle e sem arquivo. */
+static uint32_t notify_on_title(void *context) {
+    (void)context;
+    if (!g_process_type || (g_process_type() & 0xFFu) != PROC_USER ||
+        !g_loader_state || g_loader_state() != LOADER_TITLE_RUNNING) {
+        g_notify_result = 2u;
+        return 0;
+    }
+    g_queue_ui(NOTICE_TYPE_EXCLAIM, NOTICE_USER_ANY, NOTICE_AREA_SYSTEM, g_notice_wide, NULL);
+    g_notify_result = 1u;
+    return 0;
+}
+
+static bool notify_prepare(void) {
+    if (g_notify_ready) return g_queue_ui && g_loader_state && g_process_type;
+    g_notify_ready = true;
+    g_queue_ui = (xnotify_queue_ui_fn)resolve_ordinal("xam.xex", XAM_ORD_NOTIFY_QUEUE_UI);
+    g_loader_state = (xam_dword_fn)resolve_ordinal("xam.xex", XAM_ORD_LOADER_GET_STATE);
+    g_process_type = (xam_dword_fn)resolve_ordinal("xboxkrnl.exe", KRNL_ORD_PROCESS_TYPE);
+    g_xapi_startup = find_xapi_startup();
+    if (!g_queue_ui || !g_loader_state || !g_process_type) return false;
+    if (g_xapi_startup)
+        xsdk_plugin_log("notify: XapiThreadStartup resolved");
+    else
+        xsdk_plugin_log("notify: XapiThreadStartup absent; title flag only");
+    return true;
+}
+
+/* Esta thread pode parar no XAM. A thread que pagina o controle só deixa o texto. */
+static uint32_t notify_worker(void *context) {
+    (void)context;
+    for (;;) {
+        HANDLE thread = 0;
+        NTSTATUS status;
+        int64_t timeout;
+        if (!g_notify_busy) {
+            sleep_ms(20);
+            continue;
+        }
+        if (!notify_prepare()) {
+            if (!g_notify_logged_unavailable) {
+                g_notify_logged_unavailable = true;
+                xsdk_plugin_log("notify: title thread unavailable");
+            }
+            g_notify_busy = false;
+            continue;
+        }
+        g_notify_result = 0;
+        xsdk_plugin_log("notify: queue type=34 startup=%u", g_xapi_startup ? 1u : 0u);
+        status = ExCreateThread(&thread, NOTICE_STACK, NULL, g_xapi_startup, (void *)notify_on_title, NULL,
+                                NOTICE_TITLE_EXEC | NOTICE_RETURN_KTHREAD);
+        if (!NT_SUCCESS(status) || !thread) {
+            xsdk_plugin_log("notify: title thread create failed status=0x%08X", (unsigned)status);
+            g_notify_busy = false;
+            continue;
+        }
+        timeout = -((int64_t)NOTICE_WAIT_MS * 10000LL);
+        status = KeWaitForSingleObject((void *)(uintptr_t)thread, 0, 0, 0, &timeout);
+        if (status == 0)
+            xsdk_plugin_log("notify: title thread returned result=%u", (unsigned)g_notify_result);
+        else {
+            g_notify_stuck = true;
+            xsdk_plugin_log("notify: title thread timed out");
+        }
+        ObDereferenceObject((uint32_t)(uintptr_t)thread);
+        g_notify_busy = false;
+    }
+    return 0;
+}
+
+static void notify_worker_start(void) {
+    HANDLE thread = 0;
+    NTSTATUS status;
+    if (g_notify_worker_up) return;
+    status = ExCreateThread(&thread, NOTICE_STACK, NULL, NULL, (void *)notify_worker, NULL,
+                            NOTICE_SYSTEM | NOTICE_RETURN_KTHREAD);
+    if (!NT_SUCCESS(status) || !thread) {
+        xsdk_plugin_log("notify: worker failed status=0x%08X", (unsigned)status);
+        return;
+    }
+    ObDereferenceObject((uint32_t)(uintptr_t)thread);
+    g_notify_worker_up = true;
+}
+
+static bool notify_system(const char *text) {
+    if (!text || text[0] == '\0') return true;
+    if (g_notify_stuck) return true;
+    if (g_notify_busy) return false;
+    notice_write(text);
+    utf8_to_wide(text, g_notice_wide, sizeof g_notice_wide / sizeof g_notice_wide[0]);
+    notify_worker_start();
+    if (!g_notify_worker_up) return false;
+    g_notify_busy = true;
+    return true;
+}
+
 /* ---- XamInput hooks (tarefa 08) ---------------------------------------------------------
  * Same three points as research/repos/hiddriver360/hiddriver/main.cpp: the pointers come from
  * XexGetProcedureAddress (main.cpp:1494, 1496, 1497) and the detour goes on those pointers
@@ -329,11 +535,6 @@ static uint64_t now_ms(void) {
 #define KRNL_ORD_XINPUTD_READ_STATE      486u /* xboxkrnl.exe, main.cpp:1494 */
 #define XAM_ORD_INPUT_GET_CAPABILITIES_EX 685u /* xam.xex,      main.cpp:1496 */
 #define XAM_ORD_INPUT_SET_STATE           402u /* xam.xex,      main.cpp:1497 */
-#define XAM_ORD_INPUT_GET_KEYSTROKE       403u /* xam 0x193: tecla do jogo e do painel */
-#define XAM_ORD_INPUT_GET_KEYSTROKE_EX    408u /* xam 0x198 */
-#define XAM_ORD_INPUT_GET_KEYSTROKE_HUD   409u /* xam 0x199: tecla do painel */
-#define XAM_ORD_INPUT_GET_KEYSTROKE_HUD_EX 413u /* xam 0x19D */
-#define XAM_ORD_SYSUI_BY_XENON            483u /* xam 0x1E3: painel aberto pelo botão central */
 #define XAM_ORD_SEND_XENON_BUTTON        1286u /* xkelib _xamext.h: abre o painel do Xbox */
 
 /* XInputdReadState(deviceContext, packetNumber, gamepad, unk), main.cpp:1365. */
@@ -347,9 +548,7 @@ typedef uint32_t (*xam_set_state_fn)(uint32_t user, uint32_t flags, const INPUT_
 
 _Static_assert(sizeof(INPUT_GAMEPAD) == sizeof(x360_gamepad_state_t), "gamepad layout");
 
-enum { HOOK_READ_STATE, HOOK_CAPABILITIES, HOOK_SET_STATE,
-       HOOK_KEYSTROKE, HOOK_KEYSTROKE_EX, HOOK_KEYSTROKE_HUD, HOOK_KEYSTROKE_HUD_EX,
-       HOOK_COUNT };
+enum { HOOK_READ_STATE, HOOK_CAPABILITIES, HOOK_SET_STATE, HOOK_COUNT };
 
 static x360_pad_inject_t g_pad;
 static x360_gamepad_state_t g_pad_report;   /* last HID report; empty until a transport delivers one */
@@ -368,7 +567,8 @@ static volatile uint32_t g_pad_device_context;
  */
 #define XAM_USER_BIND_DEVICE_CALLBACK_17559 0x816D9060u
 #define KERNEL_BUILD_17559                  17559u
-#define DS4_BIND_INDEX                      0u /* one DS4 only */
+#define DS4_BIND_INDEX                      0u
+#define DS4_BIND_INDEX_2                    1u
 
 typedef int (*xam_user_bind_device_callback_fn)(uint32_t controller_id, uint32_t context,
                                                 uint8_t category, uint32_t disconnect,
@@ -380,113 +580,152 @@ static bool g_pad_bound;              /* the DS4 context is registered in XAM */
 static uint8_t g_pad_bound_player;
 static uint8_t g_pad_user = 0xFFu;
 static bool g_guide_was_down;
+static bool g_guide_latched; /* PS abriu o painel; o segundo toque fecha. Sem consultar o XAM. */
 static uint32_t g_guide_last_ms;
 typedef void (*xenon_press_fn)(uint32_t user_index);
 static xenon_press_fn g_xenon_press;
-typedef uint32_t (*sysui_xenon_fn)(void);
-static sysui_xenon_fn g_sysui_by_xenon;
 static bool g_pad_bind_refused;       /* this authentication already tried and was refused */
 static bool g_pad_logged_layout;
 static bool g_pad_logged_empty;
+
+static x360_pad_inject_t g_pad2;
+static x360_gamepad_state_t g_pad2_report;
+static bool             g_pad2_ps;
+static uint8_t          g_pad2_player;
+static volatile uint32_t g_pad2_context;
+static bool             g_pad2_bound;
+static uint8_t          g_pad2_bound_player;
+static uint8_t          g_pad2_user = 0xFFu;
+static bool             g_pad2_bind_refused;
+static bool             g_player_pinned; /* o gerenciador escolheu o jogador; o XAM nao reescreve */
+static bool             g_pad2_hid;
+static bool             g_pad2_logged_no_player;
 
 static ppc_detour_t g_detours[HOOK_COUNT];
 static xinputd_read_state_fn      g_orig_read_state;
 static xam_get_capabilities_ex_fn g_orig_capabilities;
 static xam_set_state_fn           g_orig_set_state;
-typedef uint32_t (*xam_keystroke_fn)(uint32_t user, uint32_t flags, x360_keystroke_t *stroke);
-typedef uint32_t (*xam_keystroke_ex_fn)(uint32_t *user, uint32_t flags, x360_keystroke_t *stroke);
-static xam_keystroke_fn    g_orig_keystroke;
-static xam_keystroke_ex_fn g_orig_keystroke_ex;
-static xam_keystroke_fn    g_orig_keystroke_hud;
-static xam_keystroke_ex_fn g_orig_keystroke_hud_ex;
-static x360_key_tracker_t  g_key_tracker;
 /* Trampolines are code the plugin writes: they live in .text, like hiddriver's ".text" Detour buffer. */
 __asm__(".pushsection .text.bt360_trampolines,\"ax\",@progbits\n"
         ".balign 128\n"
         ".globl bt360_trampolines\n"
         "bt360_trampolines:\n"
-        ".space 840\n"            /* HOOK_COUNT * PPC_DETOUR_TRAMPOLINE_WORDS * 4 */
+        ".space 408\n"            /* HOOK_COUNT * PPC_DETOUR_TRAMPOLINE_WORDS * 4 */
         ".popsection\n");
 extern uint32_t bt360_trampolines[];
 #define g_trampolines bt360_trampolines
-_Static_assert(HOOK_COUNT * PPC_DETOUR_TRAMPOLINE_WORDS * 4u == 840u, "trampoline buffer size");
+_Static_assert(HOOK_COUNT * PPC_DETOUR_TRAMPOLINE_WORDS * 4u == 408u, "trampoline buffer size");
 
-static bool guide_is_open(void) {
-    return g_sysui_by_xenon != NULL && g_sysui_by_xenon() != 0u;
+/* Troca na leitura, como o X360Remap: a tela de perfil e o teclado só leem o jogador 1.
+ * O estado do DS4 ocupa essa leitura. O controle oficial volta no slot do DS4. */
+#define PAD_SWAP_MS 500u
+static uint32_t g_player1_context;
+static uint32_t g_swap_ms;
+static x360_gamepad_state_t g_displaced;
+static x360_gamepad_state_t g_displaced_last;
+static x360_gamepad_state_t g_swap_last;
+
+static bool swap_fresh(void) {
+    return g_swap_ms != 0u && (uint32_t)now_ms() - g_swap_ms < PAD_SWAP_MS;
 }
 
-/* O painel do usuário 0 lê o controle oficial. Enquanto ele está aberto e esse
- * controle está parado, a leitura dele leva o estado do DS4. */
-static void overlay_guide_pad(INPUT_GAMEPAD *gamepad) {
-    const x360_pad_snapshot_t snap = x360_pad_inject_snapshot(&g_pad);
-    const bool idle = gamepad->buttons == 0u && gamepad->left_trigger == 0u &&
-                      gamepad->right_trigger == 0u &&
-                      gamepad->thumb_lx > -8000 && gamepad->thumb_lx < 8000 &&
-                      gamepad->thumb_ly > -8000 && gamepad->thumb_ly < 8000 &&
-                      gamepad->thumb_rx > -8000 && gamepad->thumb_rx < 8000 &&
-                      gamepad->thumb_ry > -8000 && gamepad->thumb_ry < 8000;
-    if (!snap.active || !idle) return;
-    *gamepad = *(const INPUT_GAMEPAD *)&snap.state;
-    gamepad->buttons = (uint16_t)(gamepad->buttons & (uint16_t)~INPUT_GAMEPAD_GUIDE);
+static void bump_packet(uint32_t *packet, x360_gamepad_state_t *last, const x360_gamepad_state_t *now) {
+    if (!packet || memcmp(last, now, sizeof *now) == 0) return;
+    *last = *now;
+    *packet += 1u;
 }
 
 static uint32_t hook_read_state(uint32_t context, uint32_t *packet, INPUT_GAMEPAD *gamepad,
                                 uint32_t *unk) {
-    uint32_t status = g_orig_read_state(context, packet, gamepad, unk);
-    const uint32_t ds4_context = g_pad_device_context;
-    const bool is_ds4 = ds4_context != 0u && context == ds4_context;
-    const uint32_t result = x360_pad_inject_filter_read_state(&g_pad, is_ds4, status, packet,
-                                                              (x360_gamepad_state_t *)gamepad);
+    const bool is0 = g_pad_device_context != 0u && context == g_pad_device_context;
+    const bool is1 = g_pad2_context != 0u && context == g_pad2_context;
+    const bool both = g_pad_bound && g_pad2_bound;
+    x360_pad_inject_t *swap_pad = &g_pad;
+    uint8_t swap_user = g_pad_user;
+    uint32_t swap_context = g_pad_device_context;
+    const uint32_t status = g_orig_read_state(context, packet, gamepad, unk);
+    const uint32_t result = is1
+        ? x360_pad_inject_filter_read_state(&g_pad2, true, status, packet,
+                                            (x360_gamepad_state_t *)gamepad)
+        : x360_pad_inject_filter_read_state(&g_pad, is0, status, packet,
+                                            (x360_gamepad_state_t *)gamepad);
     if (result == X360_PAD_ERROR_SUCCESS && status != X360_PAD_ERROR_SUCCESS && unk) *unk = 0u;
-    if (!is_ds4 && result == X360_PAD_ERROR_SUCCESS && gamepad && guide_is_open())
-        overlay_guide_pad(gamepad);
+    /* O controle marcado como jogador 1 responde a leitura do usuário 0,
+     * mesmo quando o XAM o registrou em outro usuário e essa leitura falha. */
+    if (gamepad) {
+        x360_pad_inject_t *as_player1 = NULL;
+        uint32_t player1_context = 0;
+        if (g_pad_bound && g_pad_player == 1u && g_pad_device_context != 0u) {
+            as_player1 = &g_pad;
+            player1_context = g_pad_device_context;
+        } else if (g_pad2_bound && g_pad2_player == 1u && g_pad2_context != 0u) {
+            as_player1 = &g_pad2;
+            player1_context = g_pad2_context;
+        }
+        if (as_player1 && context != player1_context &&
+            context != g_pad_device_context && context != g_pad2_context) {
+            const x360_pad_snapshot_t snap = x360_pad_inject_snapshot(as_player1);
+            if (snap.active && context != 0u) {
+                if (g_player1_context == 0u || context < g_player1_context)
+                    g_player1_context = context;
+                if (context == g_player1_context) {
+                    x360_gamepad_state_t shown = snap.state;
+                    shown.buttons = (uint16_t)(shown.buttons & (uint16_t)~X360_BTN_GUIDE);
+                    *(x360_gamepad_state_t *)gamepad = shown;
+                    bump_packet(packet, &g_swap_last, &shown);
+                    if (unk) *unk = 0u;
+                    return X360_PAD_ERROR_SUCCESS;
+                }
+            }
+        }
+    }
+    if (!gamepad || result != X360_PAD_ERROR_SUCCESS || both) return result;
+    if (!g_pad_bound && g_pad2_bound) {
+        swap_pad = &g_pad2;
+        swap_user = g_pad2_user;
+        swap_context = g_pad2_context;
+    }
+    const bool is_ds4 = swap_context != 0u && context == swap_context;
+
+    const x360_pad_snapshot_t snap = x360_pad_inject_snapshot(swap_pad);
+    const bool other_player = swap_user != 0u && swap_user != 0xFFu;
+    if (!snap.active || !other_player) return result;
+
+    if (is_ds4) {
+        if (!swap_fresh()) return result;
+        *(x360_gamepad_state_t *)gamepad = g_displaced;
+        bump_packet(packet, &g_displaced_last, &g_displaced);
+        return result;
+    }
+
+    if (g_player1_context == 0u || context < g_player1_context) g_player1_context = context;
+    if (context != g_player1_context) return result;
+
+    g_displaced = *(x360_gamepad_state_t *)gamepad;
+    g_swap_ms = (uint32_t)now_ms();
+    x360_gamepad_state_t shown = snap.state;
+    shown.buttons = (uint16_t)(shown.buttons & (uint16_t)~X360_BTN_GUIDE);
+    *(x360_gamepad_state_t *)gamepad = shown;
+    bump_packet(packet, &g_swap_last, &shown);
     return result;
 }
 
 static uint32_t hook_capabilities(uint32_t unk, uint32_t user, uint32_t flags, x360_pad_caps_t *caps) {
     const uint32_t status = g_orig_capabilities(unk, user, flags, caps);
-    return x360_pad_inject_filter_capabilities(&g_pad, user, status, caps);
+    const uint32_t first = x360_pad_inject_filter_capabilities(&g_pad, user, status, caps);
+    if (first != status) return first;
+    return x360_pad_inject_filter_capabilities(&g_pad2, user, status, caps);
 }
 
 static uint32_t hook_set_state(uint32_t user, uint32_t flags, const INPUT_VIBRATION *vibration) {
     const uint32_t status = g_orig_set_state(user, flags, vibration);
     if (!vibration) return status;
-    return x360_pad_inject_filter_set_state(&g_pad, user, status, vibration->left_motor_speed,
+    const uint32_t first = x360_pad_inject_filter_set_state(&g_pad, user, status,
+                                                            vibration->left_motor_speed,
+                                                            vibration->right_motor_speed);
+    if (first != status) return first;
+    return x360_pad_inject_filter_set_state(&g_pad2, user, status, vibration->left_motor_speed,
                                             vibration->right_motor_speed);
-}
-
-/* O painel aberto pelo PS é o do usuário 0. A tecla do DS4 só entra nessa consulta. */
-static uint32_t supply_guide_key(uint32_t status, uint32_t user, x360_keystroke_t *stroke) {
-    if (!stroke || status == X360_PAD_ERROR_SUCCESS) return status;
-    if (!guide_is_open() || x360_pad_inject_normalize_user(user) != 0u) return status;
-    const x360_pad_snapshot_t snap = x360_pad_inject_snapshot(&g_pad);
-    if (!snap.active) return status;
-    x360_keystroke_t gen;
-    if (x360_pad_keystroke_next(&g_key_tracker, &snap.state, 0u,
-                                (uint32_t)now_ms(), &gen) != X360_PAD_ERROR_SUCCESS)
-        return status;
-    *stroke = gen;
-    return X360_PAD_ERROR_SUCCESS;
-}
-
-static uint32_t hook_keystroke(uint32_t user, uint32_t flags, x360_keystroke_t *stroke) {
-    const uint32_t status = g_orig_keystroke(user, flags, stroke);
-    return supply_guide_key(status, user, stroke);
-}
-
-static uint32_t hook_keystroke_hud(uint32_t user, uint32_t flags, x360_keystroke_t *stroke) {
-    const uint32_t status = g_orig_keystroke_hud(user, flags, stroke);
-    return supply_guide_key(status, user, stroke);
-}
-
-static uint32_t hook_keystroke_ex(uint32_t *user, uint32_t flags, x360_keystroke_t *stroke) {
-    const uint32_t status = g_orig_keystroke_ex(user, flags, stroke);
-    return supply_guide_key(status, user ? *user : 0u, stroke);
-}
-
-static uint32_t hook_keystroke_hud_ex(uint32_t *user, uint32_t flags, x360_keystroke_t *stroke) {
-    const uint32_t status = g_orig_keystroke_hud_ex(user, flags, stroke);
-    return supply_guide_key(status, user ? *user : 0u, stroke);
 }
 
 /* Data cache to memory, then the instruction cache (the sequence of xsdk_code_flush, which the
@@ -544,21 +783,6 @@ static void pad_hooks_install(void) {
                  (const void *)hook_capabilities, (void **)&g_orig_capabilities);
     hook_install("XamInputSetState", xam, XAM_ORD_INPUT_SET_STATE, HOOK_SET_STATE,
                  (const void *)hook_set_state, (void **)&g_orig_set_state);
-    hook_install("XamInputGetKeystroke", xam, XAM_ORD_INPUT_GET_KEYSTROKE, HOOK_KEYSTROKE,
-                 (const void *)hook_keystroke, (void **)&g_orig_keystroke);
-    hook_install("XamInputGetKeystrokeEx", xam, XAM_ORD_INPUT_GET_KEYSTROKE_EX, HOOK_KEYSTROKE_EX,
-                 (const void *)hook_keystroke_ex, (void **)&g_orig_keystroke_ex);
-    hook_install("XamInputGetKeystrokeHud", xam, XAM_ORD_INPUT_GET_KEYSTROKE_HUD, HOOK_KEYSTROKE_HUD,
-                 (const void *)hook_keystroke_hud, (void **)&g_orig_keystroke_hud);
-    hook_install("XamInputGetKeystrokeHudEx", xam, XAM_ORD_INPUT_GET_KEYSTROKE_HUD_EX,
-                 HOOK_KEYSTROKE_HUD_EX, (const void *)hook_keystroke_hud_ex,
-                 (void **)&g_orig_keystroke_hud_ex);
-    void *sysui = NULL;
-    if (xam && NT_SUCCESS(XexGetProcedureAddress(xam, XAM_ORD_SYSUI_BY_XENON, &sysui)) &&
-        sysui && MmIsAddressValid(sysui))
-        g_sysui_by_xenon = (sysui_xenon_fn)sysui;
-    xsdk_plugin_log("pad: XamIsSysUiInvokedByXenonButton ordinal %u %s",
-                    (unsigned)XAM_ORD_SYSUI_BY_XENON, g_sysui_by_xenon ? "resolved" : "missing");
     void *xenon = NULL;
     if (xam && NT_SUCCESS(XexGetProcedureAddress(xam, XAM_ORD_SEND_XENON_BUTTON, &xenon)) &&
         xenon && MmIsAddressValid(xenon)) {
@@ -584,8 +808,8 @@ static void pad_write_slot(void *ctx, uint8_t user_index, const x360_gamepad_sta
 }
 
 static void pad_send_report(void *ctx, const uint8_t *report, size_t len) {
-    (void)ctx;
-    if (bt_hid_link_output(report, len) != 0) {
+    const int slot = ctx == (void *)1 ? 1 : 0;
+    if (bt_hid_link_output(slot, report, len) != 0) {
         static bool logged;
         if (!logged) {
             logged = true;
@@ -594,10 +818,9 @@ static void pad_send_report(void *ctx, const uint8_t *report, size_t len) {
     }
 }
 
-/* "Down": removes the DS4 context from XAM and clears only the DS4's own state. */
-static void pad_unbind(void) {
-    g_pad_device_context = 0u; /* hooks stop answering before the context disappears */
-    x360_pad_inject_drop(&g_pad);
+/* Tira o DS4 da lista do XAM. O estado publicado continua, para a navegação do painel. */
+static void pad_release_xam(void) {
+    g_pad_device_context = 0u;
     if (g_pad_bound && g_bind_device) {
         g_bind_device(x360_pad_controller_id(DS4_BIND_INDEX), x360_pad_device_context(DS4_BIND_INDEX),
                       0u, 1u, NULL);
@@ -606,11 +829,25 @@ static void pad_unbind(void) {
     g_pad_bound = false;
     g_pad_bound_player = 0u;
     g_pad_user = 0xFFu;
-    g_guide_was_down = false;
-    g_guide_last_ms = 0u;
-    memset(&g_key_tracker, 0, sizeof g_key_tracker);
 }
 
+/* "Down": removes the DS4 context from XAM and clears only the DS4's own state. */
+static void pad_unbind(void) {
+    pad_release_xam();
+    x360_pad_inject_drop(&g_pad);
+    g_guide_was_down = false;
+    g_guide_latched = false;
+    g_guide_last_ms = 0u;
+    g_player1_context = 0u;
+    g_swap_ms = 0u;
+    memset(&g_displaced, 0, sizeof g_displaced);
+    memset(&g_displaced_last, 0, sizeof g_displaced_last);
+    memset(&g_swap_last, 0, sizeof g_swap_last);
+}
+
+/* O XAM devolve o usuario livre. Se ele nao e o jogador que escolhemos, o
+ * controle fica aceso e nenhum botao sai. O usuario 0 de um jogador 2+ continua
+ * sendo o controle oficial e nao entra aqui. */
 /* "Up": registers the DS4 context and checks which user XAM gave it. */
 static bool pad_bind(uint8_t player) {
     if (!g_layout_17559 || !g_bind_device) {
@@ -624,7 +861,10 @@ static bool pad_bind(uint8_t player) {
     uint8_t user = X360_PAD_USER_INDEX_NONE;
     const uint32_t context = x360_pad_device_context(DS4_BIND_INDEX);
     const int result = g_bind_device(x360_pad_controller_id(DS4_BIND_INDEX), context, 0u, 0u, &user);
-    const x360_pad_bind_verdict_t verdict = x360_pad_inject_check_bind(player, user);
+    x360_pad_bind_verdict_t verdict = x360_pad_inject_check_bind(player, user);
+    /* O jogador gravado permanece. O XAM pode entregar outro usuário; os botões
+     * saem mesmo assim, e o jogador 1 é espelhado na leitura do usuário 0. */
+    if (verdict == X360_PAD_BIND_MISMATCH && user < 4u) verdict = X360_PAD_BIND_OK;
     xsdk_plugin_log("pad: bind result=%d userIndex=%u player=%u verdict=%u", result, (unsigned)user,
                     (unsigned)player, (unsigned)verdict);
     if (verdict != X360_PAD_BIND_OK) {
@@ -646,14 +886,32 @@ static bool pad_bind(uint8_t player) {
     return true;
 }
 
+/* Os dois gravados no mesmo número deixam o jogador 1 vazio. O primeiro ligado assume. */
+static void claim_player1(void) {
+    const bool primary_up = g_session.established &&
+                            g_session.player >= 1u && g_session.player <= 4u;
+    const bool second_up = g_session.second.established &&
+                           g_session.second.player >= 1u && g_session.second.player <= 4u;
+    if (g_player_pinned) return;
+    if (primary_up && g_session.player == 1u) return;
+    if (second_up && g_session.second.player == 1u) return;
+    if (!primary_up || !second_up || g_session.player != g_session.second.player) return;
+    g_session.player = 1u;
+    if (g_session.has_peer && bt_manager_set_player(&g_ipc, g_session.peer, 1u) >= 0)
+        pair_persist(NULL, &g_ipc);
+    g_player_pinned = true;
+    xsdk_plugin_log("pad: shared player split; first controller is player 1");
+}
+
 /* Plugin thread, every tick: mirrors the pairing session into XAM through x360_pad_inject. */
 static void pad_service(void) {
+    claim_player1();
     const bool authenticated = g_session.state == BT_PAIR_CONNECTED && g_session.established;
     if (g_session.player >= X360_PAD_PLAYER_MIN && g_session.player <= X360_PAD_PLAYER_MAX)
         g_pad_player = g_session.player;
     if (!authenticated) {
         if (g_hid_up) {
-            bt_hid_link_stop();
+            bt_hid_link_stop(0);
             g_hid_up = false;
         }
         pad_unbind();
@@ -664,7 +922,7 @@ static void pad_service(void) {
     /* O DS4 derruba o ACL se o HID não abrir. Isso não espera o jogador do XAM. */
     if (!g_hid_up && g_session.encrypted &&
         g_session.acl_handle != 0 && g_session.acl_handle != 0xFFFFu) {
-        if (bt_hid_link_start(g_session.acl_handle) == 0)
+        if (bt_hid_link_start(0, g_session.acl_handle) == 0)
             g_hid_up = true;
     }
     if (g_pad_player == 0u) {
@@ -691,19 +949,102 @@ static void pad_service(void) {
     const uint32_t now = (uint32_t)now_ms();
     if (guide_down && g_xenon_press &&
         (!g_guide_was_down || now - g_guide_last_ms >= 1000u)) {
-        if (!g_guide_was_down) xsdk_plugin_log("pad: guide press user=0");
+        if (!g_guide_was_down) {
+            g_guide_latched = !g_guide_latched;
+            xsdk_plugin_log("pad: guide press user=0 latched=%u", g_guide_latched ? 1u : 0u);
+        }
         g_guide_last_ms = now;
         g_xenon_press(0u);
     }
     g_guide_was_down = guide_down;
 }
 
+static void pad2_unbind(void) {
+    g_pad2_context = 0u;
+    if (g_pad2_bound && g_bind_device) {
+        g_bind_device(x360_pad_controller_id(DS4_BIND_INDEX_2),
+                      x360_pad_device_context(DS4_BIND_INDEX_2), 0u, 1u, NULL);
+        xsdk_plugin_log("pad: second DS4 unbound (player %u)", (unsigned)g_pad2_bound_player);
+    }
+    g_pad2_bound = false;
+    g_pad2_bound_player = 0u;
+    g_pad2_user = 0xFFu;
+    x360_pad_inject_drop(&g_pad2);
+}
+
+static bool pad2_bind(uint8_t player) {
+    uint8_t user = X360_PAD_USER_INDEX_NONE;
+    const uint32_t context = x360_pad_device_context(DS4_BIND_INDEX_2);
+    const int result = g_bind_device(x360_pad_controller_id(DS4_BIND_INDEX_2), context, 0u, 0u, &user);
+    x360_pad_bind_verdict_t verdict = x360_pad_inject_check_bind(player, user);
+    if (verdict == X360_PAD_BIND_MISMATCH && user < 4u) verdict = X360_PAD_BIND_OK;
+    xsdk_plugin_log("pad: second bind result=%d userIndex=%u player=%u verdict=%u", result,
+                    (unsigned)user, (unsigned)player, (unsigned)verdict);
+    if (verdict != X360_PAD_BIND_OK) {
+        g_bind_device(x360_pad_controller_id(DS4_BIND_INDEX_2), context, 0u, 1u, NULL);
+        return false;
+    }
+    g_pad2_bound = true;
+    g_pad2_bound_player = player;
+    g_pad2_user = user;
+    g_pad2_context = context;
+    xsdk_plugin_log("pad: second DS4 context 0x%08X bound on user %u", (unsigned)context,
+                    (unsigned)user);
+    return true;
+}
+
+static void pad2_service(void) {
+    const bool up = g_session.second.established;
+    if (g_session.second.player >= X360_PAD_PLAYER_MIN &&
+        g_session.second.player <= X360_PAD_PLAYER_MAX)
+        g_pad2_player = g_session.second.player;
+    if (!up) {
+        if (g_pad2_hid) {
+            bt_hid_link_stop(1);
+            g_pad2_hid = false;
+        }
+        pad2_unbind();
+        g_pad2_logged_no_player = false;
+        g_pad2_bind_refused = false;
+        return;
+    }
+    if (!g_pad2_hid && g_session.second.encrypted &&
+        g_session.second.acl_handle != 0 && g_session.second.acl_handle != 0xFFFFu) {
+        if (bt_hid_link_start(1, g_session.second.acl_handle) == 0) g_pad2_hid = true;
+    }
+    if (!g_layout_17559 || !g_bind_device) return;
+    if (g_pad2_player == 0u) {
+        if (!g_pad2_logged_no_player) {
+            g_pad2_logged_no_player = true;
+            xsdk_plugin_log("pad: second DS4 authenticated but no player; not publishing");
+        }
+        return;
+    }
+    if (g_pad2_bound && g_pad2_bound_player != g_pad2_player) {
+        pad2_unbind();
+        g_pad2_bind_refused = false;
+    }
+    if (!g_pad2_bound) {
+        if (g_pad2_bind_refused) return;
+        if (!pad2_bind(g_pad2_player)) {
+            g_pad2_bind_refused = true;
+            return;
+        }
+    }
+    x360_pad_inject_publish(&g_pad2, true, g_pad2_player, &g_pad2_report, g_pad2_ps);
+}
+
 static void pad_setup(void) {
-    const x360_pad_sink_t sink = { .ctx = NULL, .write_slot = pad_write_slot,
-                                   .send_report = pad_send_report };
-    x360_pad_inject_init(&g_pad, &sink);
+    const x360_pad_sink_t sink0 = { .ctx = (void *)0, .write_slot = pad_write_slot,
+                                    .send_report = pad_send_report };
+    const x360_pad_sink_t sink1 = { .ctx = (void *)1, .write_slot = pad_write_slot,
+                                    .send_report = pad_send_report };
+    x360_pad_inject_init(&g_pad, &sink0);
+    x360_pad_inject_init(&g_pad2, &sink1);
     memset(&g_pad_report, 0, sizeof g_pad_report);
-    bt_hid_link_bind(&g_pad_report, &g_pad_ps);
+    memset(&g_pad2_report, 0, sizeof g_pad2_report);
+    bt_hid_link_bind(0, &g_pad_report, &g_pad_ps);
+    bt_hid_link_bind(1, &g_pad2_report, &g_pad2_ps);
     x360_usbd_set_acl_rx(bt_hid_link_on_acl);
     pad_hooks_install();
 }
@@ -843,6 +1184,7 @@ static void pair_session_service(uint32_t stage, uint32_t *ready_ms, bool *sessi
     }
     bt_pair_session_tick(&g_session, now);
     pad_service();
+    pad2_service();
 }
 
 /* A inquiry dura 48 * 1,28 s. Sem o evento de fim, a tela ficava buscando. */
@@ -1080,27 +1422,75 @@ void plugin_main(HANDLE module) {
                         request.slot >= 1u && request.slot <= 4u) {
                         if (bt_manager_set_player(&g_ipc, request.address,
                                                   (uint8_t)request.slot) >= 0) {
+                            const bt_paired_device_t *primary;
+                            const bt_paired_device_t *second;
                             pair_persist(NULL, &g_ipc);
+                            g_player_pinned = true;
+                            primary = g_session.has_peer
+                                          ? bt_manager_find_paired(&g_ipc, g_session.peer) : NULL;
+                            second = g_session.second.active
+                                         ? bt_manager_find_paired(&g_ipc, g_session.second.peer)
+                                         : NULL;
                             if (g_session.has_peer &&
-                                memcmp(g_session.peer, request.address, 6u) == 0)
+                                memcmp(request.address, g_session.peer, 6u) == 0)
                                 g_session.player = (uint8_t)request.slot;
+                            else if (primary && primary->player >= 1u && primary->player <= 4u)
+                                g_session.player = primary->player;
+                            if (g_session.second.active &&
+                                memcmp(request.address, g_session.second.peer, 6u) == 0)
+                                g_session.second.player = (uint8_t)request.slot;
+                            else if (second && second->player >= 1u && second->player <= 4u)
+                                g_session.second.player = second->player;
+                            xsdk_plugin_log("pad: players now %u and %u",
+                                            (unsigned)g_session.player,
+                                            (unsigned)g_session.second.player);
                         }
                     } else if (seen)
                         bt_pair_session_connect_known(&g_session, seen, now_ms());
-                    else
-                        bt_pair_session_on_command(&g_session, request.command,
-                                                   has_address ? request.address : NULL, now_ms());
+                    else {
+                        const uint8_t *cmd_addr = has_address ? request.address : NULL;
+                        uint8_t slot_addr[6];
+                        if (request.command == BT_IPC_CMD_DISCONNECT_SLOT && !has_address &&
+                            request.slot < 4u) {
+                            for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
+                                if (!g_ipc.paired[i].valid) continue;
+                                if (g_ipc.paired[i].player != (uint8_t)(request.slot + 1u)) continue;
+                                memcpy(slot_addr, g_ipc.paired[i].bd_addr, 6u);
+                                cmd_addr = slot_addr;
+                                break;
+                            }
+                        }
+                        bt_pair_session_on_command(&g_session, request.command, cmd_addr, now_ms());
+                    }
                 }
             }
             /* Console sees the DS4 event while it lasts; the adapter phrase otherwise. */
             const bool ds4_event = g_session.phrase_id != BT_PHRASE_NONE;
-            uint8_t link = BT_LINK_DOWN;
-            if (g_session.state == BT_PAIR_CONNECTING || g_session.state == BT_PAIR_AUTH)
-                link = BT_LINK_CONNECTING;
-            else if (g_session.state == BT_PAIR_CONNECTED && g_session.established)
-                link = BT_LINK_UP;
-            const bool share = (g_pad_report.buttons & X360_BTN_BACK) != 0 &&
-                               g_session.player >= 1u && g_session.player <= 4u;
+            uint8_t link_a = BT_LINK_DOWN;
+            uint8_t link_b = BT_LINK_DOWN;
+            uint8_t packed_player = 0;
+            uint8_t packed_link = 0;
+            if (g_session.state == BT_PAIR_CONNECTED && g_session.established)
+                link_a = BT_LINK_UP;
+            else if (g_session.state == BT_PAIR_CONNECTING || g_session.state == BT_PAIR_AUTH)
+                link_a = BT_LINK_CONNECTING;
+            if (g_session.second.established)
+                link_b = BT_LINK_UP;
+            else if (g_session.second.state == BT_PAIR_CONNECTING ||
+                     g_session.second.state == BT_PAIR_AUTH)
+                link_b = BT_LINK_CONNECTING;
+            bt_manager_pack_links(&packed_player, &packed_link, g_session.player, link_a,
+                                  g_session.second.player, link_b);
+            uint8_t share_player = 0u;
+            if ((g_pad_report.buttons & X360_BTN_BACK) != 0 &&
+                g_session.state == BT_PAIR_CONNECTED && g_session.established &&
+                g_session.player >= 1u && g_session.player <= 4u) {
+                share_player = g_session.player;
+            } else if ((g_pad2_report.buttons & X360_BTN_BACK) != 0 &&
+                       g_session.second.established &&
+                       g_session.second.player >= 1u && g_session.second.player <= 4u) {
+                share_player = g_session.second.player;
+            }
             const bt_console_reply_t reply = {
                 .magic = BT_IPC_MAGIC,
                 .version = BT_IPC_VERSION,
@@ -1108,10 +1498,10 @@ void plugin_main(HANDLE module) {
                 .usb_status = rc,
                 .adapter_stage = shown,
                 .phrase_id = ds4_event ? g_session.phrase_id : phrase_id,
-                .player = (ds4_event || link != BT_LINK_DOWN) ? g_session.player : player,
+                .player = packed_player != 0u ? packed_player : player,
                 .pair_active = g_session.pair_active ? 1u : 0u,
-                .link = link,
-                .reserved = share ? g_session.player : 0u
+                .link = packed_link,
+                .reserved = share_player
             };
             if (bt_console_write_reply(&reply)) {
                 if (trace || write_failed) {

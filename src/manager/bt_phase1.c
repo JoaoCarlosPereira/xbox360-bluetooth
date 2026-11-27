@@ -4,10 +4,10 @@
 
 static const char *const k_phrases[] = {
     [BT_PHRASE_NONE]                   = NULL,
-    [BT_PHRASE_ADAPTER_READY]          = "Adaptador UGREEN pronto",
-    [BT_PHRASE_ADAPTER_NOT_FOUND]      = "Adaptador UGREEN não encontrado.",
+    [BT_PHRASE_ADAPTER_READY]          = "Adaptador Bluetooth pronto",
+    [BT_PHRASE_ADAPTER_NOT_FOUND]      = "Adaptador Bluetooth não encontrado.",
     [BT_PHRASE_ADAPTER_WRONG]          = "Este adaptador não faz parte desta entrega.",
-    [BT_PHRASE_ADAPTER_DISCONNECTED]   = "Adaptador UGREEN desconectado.",
+    [BT_PHRASE_ADAPTER_DISCONNECTED]   = "Adaptador Bluetooth desconectado.",
     [BT_PHRASE_DS4_PAIRED_PLAYER1]     = "DualShock 4 pareado no Jogador 1",
     [BT_PHRASE_DS4_PAIRED_PLAYER2]     = "DualShock 4 pareado no Jogador 2",
     [BT_PHRASE_DS4_ALREADY_PAIRED]     = "Já existe um DualShock 4 pareado.",

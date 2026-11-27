@@ -13,8 +13,8 @@ static void test_adp_02_no_ugreen(void)
     };
     bt_phase1_decision_t d = bt_phase1_decide(&ctx);
     assert(d.phrase_id == BT_PHRASE_ADAPTER_NOT_FOUND);
-    assert(strcmp(bt_phase1_phrase_text(d.phrase_id), "Adaptador UGREEN não encontrado.") == 0);
-    printf("[PASS] ADP-02 sem UGREEN\n");
+    assert(strcmp(bt_phase1_phrase_text(d.phrase_id), "Adaptador Bluetooth não encontrado.") == 0);
+    printf("[PASS] ADP-02 sem Bluetooth\n");
 }
 
 static void test_adp_03_wrong_adapter(void)
@@ -38,12 +38,12 @@ static void test_sta_01_adapter_state_phrases(void)
     };
     bt_phase1_decision_t ready = bt_phase1_decide(&ready_ctx);
     assert(ready.phrase_id == BT_PHRASE_ADAPTER_READY);
-    assert(strcmp(bt_phase1_phrase_text(ready.phrase_id), "Adaptador UGREEN pronto") == 0);
+    assert(strcmp(bt_phase1_phrase_text(ready.phrase_id), "Adaptador Bluetooth pronto") == 0);
 
     assert(strcmp(bt_phase1_phrase_text(BT_PHRASE_ADAPTER_NOT_FOUND),
-                 "Adaptador UGREEN não encontrado.") == 0);
+                 "Adaptador Bluetooth não encontrado.") == 0);
     assert(strcmp(bt_phase1_phrase_text(BT_PHRASE_ADAPTER_DISCONNECTED),
-                 "Adaptador UGREEN desconectado.") == 0);
+                 "Adaptador Bluetooth desconectado.") == 0);
 
     assert(bt_phase1_is_adapter_state_phrase(BT_PHRASE_ADAPTER_READY));
     assert(bt_phase1_is_adapter_state_phrase(BT_PHRASE_ADAPTER_NOT_FOUND));
@@ -247,8 +247,8 @@ static void test_err_01_adapter_removed(void)
     };
     bt_phase1_decision_t d = bt_phase1_decide(&ctx);
     assert(d.phrase_id == BT_PHRASE_ADAPTER_DISCONNECTED);
-    assert(strcmp(bt_phase1_phrase_text(d.phrase_id), "Adaptador UGREEN desconectado.") == 0);
-    printf("[PASS] ERR-01 UGREEN desconectado\n");
+    assert(strcmp(bt_phase1_phrase_text(d.phrase_id), "Adaptador Bluetooth desconectado.") == 0);
+    printf("[PASS] ERR-01 Bluetooth desconectado\n");
 }
 
 static void test_err_03_ds4_disconnect(void)

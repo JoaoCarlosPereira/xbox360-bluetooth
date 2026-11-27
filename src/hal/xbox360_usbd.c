@@ -62,8 +62,8 @@ typedef struct {
     bt_usb_transport_t transport;
     uint8_t command[HCI_MAX_CMD_SIZE];
     uint8_t bulk_rx[512];
-    uint8_t acl_ring[8][512];
-    uint16_t acl_ring_n[8];
+    uint8_t acl_ring[16][512];
+    uint16_t acl_ring_n[16];
     uint32_t acl_prod;
     uint32_t acl_cons;
     uint8_t bulk_tx[516];
@@ -123,7 +123,7 @@ void x360_usbd_log_changes(void) {
     const uint32_t status = x360_usbd_adapter_status();
     const uint32_t n = __atomic_load_n(&matches, __ATOMIC_RELAXED);
     if (n != last_matches) {
-        xsdk_plugin_log("usb: matched UGREEN 2B89:8761 HCI interface hits=%u", n);
+        xsdk_plugin_log("usb: matched Bluetooth 2B89:8761 HCI interface hits=%u", n);
         last_matches = n;
     }
     static uint32_t last_calls;
@@ -146,19 +146,37 @@ static int32_t interrupt_done(void *trb, int32_t status);
 static int32_t bulk_in_done(void *trb, int32_t status);
 static int32_t bulk_out_done(void *trb, int32_t status);
 
+/* Sinalização L2CAP (CID 1) abre o canal do segundo controle. Um relatório HID
+ * não pode ocupar o lugar dela quando o anel enche. */
+static int acl_is_signaling(const uint8_t *data, uint32_t n) {
+    uint16_t dlen;
+    uint16_t cid;
+    if (!data || n < 8u) return 1;
+    dlen = (uint16_t)(data[2] | ((uint16_t)data[3] << 8));
+    if ((uint32_t)dlen + 4u > n || dlen < 4u) return 1;
+    cid = (uint16_t)(data[6] | ((uint16_t)data[7] << 8));
+    return cid == 0x0001u;
+}
+
 static void acl_push(const uint8_t *data, uint32_t n) {
+    const uint32_t count = (uint32_t)(sizeof adapter.acl_ring / sizeof adapter.acl_ring[0]);
     if (!data || !n) return;
     if (n > sizeof adapter.acl_ring[0]) n = sizeof adapter.acl_ring[0];
     const uint32_t prod = adapter.acl_prod;
     const uint32_t cons = __atomic_load_n(&adapter.acl_cons, __ATOMIC_ACQUIRE);
-    if (prod - cons >= 8u) {
-        /* O mais novo substitui o último ainda não lido. O consumidor está 8 atrás. */
-        const uint32_t slot = (prod - 1u) & 7u;
-        memcpy(adapter.acl_ring[slot], data, n);
-        adapter.acl_ring_n[slot] = (uint16_t)n;
+    if (prod - cons >= count) {
+        uint32_t i;
+        if (!acl_is_signaling(data, n)) return;
+        for (i = cons; i != prod; i++) {
+            const uint32_t slot = i & (count - 1u);
+            if (acl_is_signaling(adapter.acl_ring[slot], adapter.acl_ring_n[slot])) continue;
+            memcpy(adapter.acl_ring[slot], data, n);
+            adapter.acl_ring_n[slot] = (uint16_t)n;
+            return;
+        }
         return;
     }
-    const uint32_t slot = prod & 7u;
+    const uint32_t slot = prod & (count - 1u);
     memcpy(adapter.acl_ring[slot], data, n);
     adapter.acl_ring_n[slot] = (uint16_t)n;
     __atomic_store_n(&adapter.acl_prod, prod + 1u, __ATOMIC_RELEASE);
@@ -168,7 +186,7 @@ static void acl_drain(void) {
     uint32_t cons = adapter.acl_cons;
     uint32_t prod = __atomic_load_n(&adapter.acl_prod, __ATOMIC_ACQUIRE);
     while (cons != prod && acl_rx) {
-        const uint32_t slot = cons & 7u;
+        const uint32_t slot = cons & 15u;
         uint16_t n = adapter.acl_ring_n[slot];
         uint8_t local[512];
         if (n > sizeof local) n = sizeof local;

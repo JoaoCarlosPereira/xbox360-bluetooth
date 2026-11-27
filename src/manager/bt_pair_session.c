@@ -76,6 +76,7 @@ void bt_pair_session_init(bt_pair_session_t *s, bt_ipc_state_t *ipc, const bt_pa
     s->ipc = ipc;
     if (ops) s->ops = *ops;
     s->acl_handle = ACL_NONE;
+    s->second.acl_handle = ACL_NONE;
 }
 
 static void publish(bt_pair_session_t *s, uint32_t phrase_id, uint8_t player) {
@@ -93,6 +94,113 @@ static void clear_link(bt_pair_session_t *s) {
     s->incoming = false;
 }
 
+static void second_clear(bt_pair_session_t *s) {
+    memset(&s->second, 0, sizeof s->second);
+    s->second.acl_handle = ACL_NONE;
+}
+
+static const bt_paired_device_t *other_stored(const bt_pair_session_t *s) {
+    if (!s->ipc) return NULL;
+    for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
+        const bt_paired_device_t *d = &s->ipc->paired[i];
+        if (!d->valid) continue;
+        if (s->has_peer && addr_eq(d->bd_addr, s->peer)) continue;
+        return d;
+    }
+    return NULL;
+}
+
+static void send_create_to(bt_pair_session_t *s, const uint8_t *addr) {
+    uint8_t cp[13];
+    memcpy(cp, addr, 6u);
+    hci_put_le16(cp + 6, 0xCC18u);
+    cp[8] = 0x01u;
+    cp[9] = 0x00;
+    hci_put_le16(cp + 10, 0);
+    cp[12] = 0x01;
+    send_cmd(s, HCI_OP_CREATE_CONNECTION, cp, sizeof cp);
+}
+
+/* O primeiro já está no ar. O segundo gravado entra sem derrubar o primeiro. */
+static void page_second(bt_pair_session_t *s) {
+    const bt_paired_device_t *other;
+    if (!s->adapter_ready || s->pair_active || s->user_held || s->scan_hold) return;
+    if (s->state != BT_PAIR_CONNECTED || !s->established) return;
+    if (s->second.established || s->second.state == BT_PAIR_CONNECTING ||
+        s->second.state == BT_PAIR_AUTH)
+        return;
+    other = other_stored(s);
+    if (!other) return;
+    s->second.active = true;
+    s->second.incoming = false;
+    s->second.established = false;
+    s->second.encrypted = false;
+    s->second.retry_armed = false;
+    s->second.acl_handle = ACL_NONE;
+    memcpy(s->second.peer, other->bd_addr, 6u);
+    s->second.player = (other->player >= 1u && other->player <= 4u) ? other->player : 0u;
+    s->second.state = BT_PAIR_CONNECTING;
+    send_create_to(s, s->second.peer);
+    note(s, "connect second", s->second.peer[0]);
+}
+
+static bool links_down(const bt_pair_session_t *s) {
+    const bool primary = s->state == BT_PAIR_IDLE && s->acl_handle == ACL_NONE;
+    const bool second = !s->second.active && s->second.acl_handle == ACL_NONE &&
+                        s->second.state != BT_PAIR_CONNECTING &&
+                        s->second.state != BT_PAIR_AUTH &&
+                        s->second.state != BT_PAIR_CONNECTED;
+    return primary && second;
+}
+
+static void begin_held_scan(bt_pair_session_t *s) {
+    if (!s->scan_hold || !links_down(s)) return;
+    s->scan_hold = false;
+    if (s->ops.start_inquiry)
+        s->ops.start_inquiry(s->ops.ctx, BT_PAIR_INQUIRY_UNITS);
+}
+
+static void second_fail(bt_pair_session_t *s, uint64_t now_ms, uint8_t status) {
+    const bool again = !s->user_held && !s->pair_active && !s->scan_hold && other_stored(s) != NULL;
+    /* Timeout de pagina prende o radio por 10 s. Esperar mais deixa o controle
+     * que ja esta ligado entregar os botoes entre as tentativas. */
+    const uint32_t wait = status == 0x04u ? 20000u : BT_PAIR_RECONNECT_RETRY_MS;
+    second_clear(s);
+    if (!again) {
+        begin_held_scan(s);
+        return;
+    }
+    s->second.retry_armed = true;
+    s->second.retry_at_ms = now_ms + wait;
+}
+
+static void second_establish(bt_pair_session_t *s) {
+    if (s->second.player < 1u || s->second.player > 4u) {
+        const bt_paired_device_t *known = bt_manager_find_paired(s->ipc, s->second.peer);
+        if (known && known->player >= 1u && known->player <= 4u)
+            s->second.player = known->player;
+    }
+    s->second.established = true;
+    s->second.state = BT_PAIR_CONNECTED;
+    s->second.retry_armed = false;
+    note(s, "second up", s->second.player);
+}
+
+static void accept_second(bt_pair_session_t *s, const uint8_t *addr) {
+    const bt_paired_device_t *known = bt_manager_find_paired(s->ipc, addr);
+    uint8_t reply[7];
+    second_clear(s);
+    s->second.active = true;
+    s->second.incoming = true;
+    s->second.state = BT_PAIR_CONNECTING;
+    memcpy(s->second.peer, addr, 6u);
+    if (known && known->player >= 1u && known->player <= 4u) s->second.player = known->player;
+    memcpy(reply, addr, 6u);
+    reply[6] = 0x00;
+    send_cmd(s, HCI_OP_ACCEPT_CONN_REQ, reply, sizeof reply);
+    note(s, "accept second", addr[0]);
+}
+
 static void send_create_connection(bt_pair_session_t *s) {
     uint8_t cp[13];
     memcpy(cp, s->peer, 6u);
@@ -104,8 +212,39 @@ static void send_create_connection(bt_pair_session_t *s) {
     send_cmd(s, HCI_OP_CREATE_CONNECTION, cp, sizeof cp);
 }
 
+/* O primeiro da lista que não responde não pode esconder os outros. */
+static bool addr_is_live(const bt_pair_session_t *s, const uint8_t *addr) {
+    if (!addr) return false;
+    if (s->established && s->has_peer && addr_eq(addr, s->peer)) return true;
+    if (s->second.established && addr_eq(addr, s->second.peer)) return true;
+    if ((s->second.state == BT_PAIR_CONNECTING || s->second.state == BT_PAIR_AUTH) &&
+        addr_eq(addr, s->second.peer))
+        return true;
+    return false;
+}
+
+static const uint8_t *stored_by_turn(const bt_pair_session_t *s) {
+    int count = 0;
+    int seen = 0;
+    int want;
+    if (!s || !s->ipc) return NULL;
+    for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
+        const bt_paired_device_t *d = &s->ipc->paired[i];
+        if (d->valid && !addr_is_live(s, d->bd_addr)) count++;
+    }
+    if (count <= 0) return NULL;
+    want = (int)(s->stored_turn % (uint8_t)count);
+    for (size_t i = 0; i < BT_MAX_PAIRED_DEVICES; i++) {
+        const bt_paired_device_t *d = &s->ipc->paired[i];
+        if (!d->valid || addr_is_live(s, d->bd_addr)) continue;
+        if (seen == want) return d->bd_addr;
+        seen++;
+    }
+    return NULL;
+}
+
 static void connect_stored(bt_pair_session_t *s) {
-    const uint8_t *stored = bt_pair_session_stored_addr(s);
+    const uint8_t *stored = stored_by_turn(s);
     if (!stored) return;
     clear_link(s);
     memcpy(s->peer, stored, 6u);
@@ -139,7 +278,7 @@ static void maybe_start_inquiry(bt_pair_session_t *s) {
 }
 
 /* Conexao ou autenticacao falhou antes de a sessao se estabelecer. */
-static void link_failed(bt_pair_session_t *s, uint64_t now_ms) {
+static void link_failed(bt_pair_session_t *s, uint64_t now_ms, uint8_t status) {
     clear_link(s);
     if (s->pair_active) {
         s->has_peer = false;
@@ -148,6 +287,12 @@ static void link_failed(bt_pair_session_t *s, uint64_t now_ms) {
         maybe_start_inquiry(s); /* o limite de 60 s e checado no tick */
     } else {
         s->state = BT_PAIR_IDLE;
+        if (s->scan_hold) {
+            begin_held_scan(s);
+            return;
+        }
+        /* 0x04 página, 0x08 conexão: o controle não atendeu. O próximo é o outro gravado. */
+        if (status == 0x04u || status == 0x08u) s->stored_turn++;
         arm_retry(s, now_ms);
     }
 }
@@ -157,6 +302,17 @@ static void disconnect_acl(bt_pair_session_t *s, uint16_t handle) {
     hci_put_le16(p, handle);
     p[2] = HCI_REASON_USER_END;
     send_cmd(s, HCI_OP_DISCONNECT, p, sizeof p);
+}
+
+/* O RTL8761 devolve Connection Complete com erro e um handle real. Sem o
+ * Disconnect, o Create Connection seguinte volta 0x0B (ACL já existe). */
+static void release_orphan(bt_pair_session_t *s, uint16_t handle) {
+    if (handle == 0 || handle == ACL_NONE) return;
+    if (s->established && handle == s->acl_handle) return;
+    if (s->second.established && handle == s->second.acl_handle) return;
+    s->orphan_handle = handle;
+    disconnect_acl(s, handle);
+    note(s, "release handle", handle);
 }
 
 static void select_candidate(bt_pair_session_t *s, const hci_inquiry_item_t *item) {
@@ -282,6 +438,7 @@ void bt_pair_session_adapter_ready(bt_pair_session_t *s, uint64_t now_ms) {
     s->has_peer = false;
     s->retry_armed = false;
     clear_link(s);
+    second_clear(s);
     s->adapter_ready = true;
     s->setup_pending = BT_PAIR_SETUP_ALL;
 
@@ -309,7 +466,9 @@ void bt_pair_session_adapter_lost(bt_pair_session_t *s) {
     s->retry_armed = false;
     s->phrase_id = BT_PHRASE_NONE;
     s->player = 0u;
+    s->orphan_handle = ACL_NONE;
     clear_link(s);
+    second_clear(s);
 }
 
 void bt_pair_session_on_command(bt_pair_session_t *s, uint32_t command,
@@ -321,18 +480,46 @@ void bt_pair_session_on_command(bt_pair_session_t *s, uint32_t command,
 
     /* Busca visivel: inquiry sem parear o primeiro DS4. A lista fica no transporte. */
     if (command == BT_IPC_CMD_STOP_SCAN) {
+        s->scan_hold = false;
         if (s->ops.stop_inquiry) s->ops.stop_inquiry(s->ops.ctx);
+        if (s->state == BT_PAIR_IDLE) {
+            s->user_held = false;
+            connect_stored(s);
+        } else {
+            /* O Disconnect ainda não voltou. A queda reagenda o controle gravado. */
+            s->user_held = false;
+        }
         return;
     }
     if (command == BT_IPC_CMD_START_SCAN) {
-        /* Inquiry em cima de um ACL aberto derruba o DS4 (o rádio é um só). */
-        if (s->pair_active || s->state != BT_PAIR_IDLE) return;
-        if (s->ops.start_inquiry)
-            s->ops.start_inquiry(s->ops.ctx, BT_PAIR_INQUIRY_UNITS);
+        if (s->pair_active) return;
+        /* O rádio é um ACL. Com o DS4 ligado a busca não sai; solta e procura. */
+        s->user_held = true;
+        if (links_down(s)) {
+            if (s->ops.start_inquiry)
+                s->ops.start_inquiry(s->ops.ctx, BT_PAIR_INQUIRY_UNITS);
+            return;
+        }
+        s->scan_hold = true;
+        if (s->state == BT_PAIR_CONNECTING && s->has_peer)
+            send_cmd(s, HCI_OP_CREATE_CONN_CANCEL, s->peer, 6u);
+        else if (s->acl_handle != ACL_NONE)
+            disconnect_acl(s, s->acl_handle);
+        if (s->second.state == BT_PAIR_CONNECTING && !s->second.incoming)
+            send_cmd(s, HCI_OP_CREATE_CONN_CANCEL, s->second.peer, 6u);
+        else if (s->second.acl_handle != ACL_NONE)
+            disconnect_acl(s, s->second.acl_handle);
+        s->second.retry_armed = false;
         return;
     }
 
     if (command == BT_IPC_CMD_DISCONNECT_SLOT) {
+        if (addr && s->second.active && addr_eq(addr, s->second.peer)) {
+            s->second.retry_armed = false;
+            if (s->second.acl_handle != ACL_NONE) disconnect_acl(s, s->second.acl_handle);
+            else second_clear(s);
+            return;
+        }
         s->user_held = true;
         s->retry_armed = false;
         if (s->acl_handle != ACL_NONE) disconnect_acl(s, s->acl_handle);
@@ -340,8 +527,14 @@ void bt_pair_session_on_command(bt_pair_session_t *s, uint32_t command,
     }
     if (command == BT_IPC_CMD_FORGET_PAIRED && addr) {
         const bool ours = s->has_peer && addr_eq(addr, s->peer);
+        const bool second = s->second.active && addr_eq(addr, s->second.peer);
         bt_manager_forget_paired(s->ipc, addr);
         if (s->ops.persist) s->ops.persist(s->ops.ctx, s->ipc);
+        if (second) {
+            s->second.retry_armed = false;
+            if (s->second.acl_handle != ACL_NONE) disconnect_acl(s, s->second.acl_handle);
+            else second_clear(s);
+        }
         if (ours) {
             s->user_held = true;
             s->retry_armed = false;
@@ -441,8 +634,14 @@ static void on_connection_request(bt_pair_session_t *s, const uint8_t *p, uint64
                stored_count(s) < 4) {
         accept = true;
         if (s->ops.stop_inquiry) s->ops.stop_inquiry(s->ops.ctx);
+    } else if (!s->pair_active && ds4_like && bt_manager_find_paired(s->ipc, addr) &&
+               !(s->has_peer && addr_eq(addr, s->peer)) &&
+               !s->second.established && s->second.state != BT_PAIR_CONNECTING &&
+               s->second.state != BT_PAIR_AUTH) {
+        accept_second(s, addr);
+        return;
     } else if (stored && ds4_like) {
-        second_ds4_notice(s, addr, now_ms); /* quatro ja gravados, ou pedido fora do pareamento */
+        second_ds4_notice(s, addr, now_ms); /* desconhecido, ou os dois lugares já estão ocupados */
     }
 
     if (!accept) {
@@ -468,14 +667,37 @@ static void on_connection_complete(bt_pair_session_t *s, const uint8_t *p, uint6
     const uint16_t handle = (uint16_t)(hci_get_le16(p + 1) & 0x0FFFu);
     const uint8_t *addr = p + 3;
     if (p[9] != 0x01u) return; /* so ACL */
+    /* 0x04 esgota a página sem subir o ACL. O Disconnect nesse handle, no mesmo
+     * instante, cai no outro controle que entra e reaproveita o número (0x16).
+     * O handle fica anotado e só sai se o próximo Create Connection voltar 0x0B. */
+    if (status == 0x00u && handle == s->orphan_handle)
+        s->orphan_handle = ACL_NONE;
+    else if (status != 0x00u && status != 0x04u && status != 0x16u)
+        release_orphan(s, handle);
+    else if (status != 0x00u && handle != 0 && handle != ACL_NONE)
+        s->orphan_handle = handle;
 
+    if (s->second.active && addr_eq(addr, s->second.peer) &&
+        s->second.state == BT_PAIR_CONNECTING) {
+        if (status != 0x00u) {
+            note(s, "second connect failed", status);
+            second_fail(s, now_ms, status);
+            return;
+        }
+        s->second.acl_handle = handle;
+        s->second.state = BT_PAIR_AUTH;
+        uint8_t auth2[2];
+        hci_put_le16(auth2, handle);
+        send_cmd(s, HCI_OP_AUTH_REQUESTED, auth2, sizeof auth2);
+        return;
+    }
     if (!s->has_peer || !addr_eq(addr, s->peer) || s->state != BT_PAIR_CONNECTING) {
         if (status == 0x00u) disconnect_acl(s, handle); /* conexao que nao e nossa */
         return;
     }
     if (status != 0x00u) {
         note(s, "connect failed", status);
-        link_failed(s, now_ms);
+        link_failed(s, now_ms, status);
         return;
     }
     s->acl_handle = handle;
@@ -506,7 +728,7 @@ static void establish_link(bt_pair_session_t *s, uint64_t now_ms, bool ask_encry
     if (s->pair_active && (!s->key_valid || !finish_pairing(s))) {
         note(s, "pairing rejected", s->key_valid);
         disconnect_acl(s, s->acl_handle);
-        link_failed(s, now_ms);
+        link_failed(s, now_ms, 0);
         return;
     }
     s->established = true;
@@ -517,29 +739,43 @@ static void establish_link(bt_pair_session_t *s, uint64_t now_ms, bool ask_encry
         if (stored && stored->player >= 1u && stored->player <= 4u)
             s->player = stored->player;
     }
-    if (!ask_encrypt || s->encrypted) return;
-    uint8_t enc[3];
-    hci_put_le16(enc, s->acl_handle);
-    enc[2] = 0x01;
-    send_cmd(s, HCI_OP_SET_CONN_ENCRYPT, enc, sizeof enc);
+    if (ask_encrypt && !s->encrypted) {
+        uint8_t enc[3];
+        hci_put_le16(enc, s->acl_handle);
+        enc[2] = 0x01;
+        send_cmd(s, HCI_OP_SET_CONN_ENCRYPT, enc, sizeof enc);
+    }
+    page_second(s);
 }
 
 static void on_auth_complete(bt_pair_session_t *s, const uint8_t *p, uint64_t now_ms) {
     const uint8_t status = p[0];
     const uint16_t handle = (uint16_t)(hci_get_le16(p + 1) & 0x0FFFu);
+    if (s->second.state == BT_PAIR_AUTH && handle == s->second.acl_handle) {
+        if (status == 0x0Cu || status == 0x00u) {
+            note(s, status == 0x0Cu ? "second auth deferred" : "second auth ok", status);
+            if (s->second.encrypted) second_establish(s);
+            return;
+        }
+        note(s, "second auth failed", status);
+        disconnect_acl(s, handle);
+        second_fail(s, now_ms, status);
+        return;
+    }
     if (s->state != BT_PAIR_AUTH || handle != s->acl_handle) return;
 
     /* 0x0C: o comando cruzou com a autenticação que o rádio já fazia.
-     * O Encryption Change seguinte deixa o link de pé. Desconectar aqui desliga o DS4. */
-    if (status == 0x0Cu) {
-        note(s, "auth deferred", status);
+     * 0x00 na reconexão: a cifragem chega sozinha. Pedir Set Connection Encryption
+     * nesse instante faz o DS4 cair com reason 0x13. O pareamento novo ainda pede. */
+    if (status == 0x0Cu || (status == 0x00u && !s->pair_active)) {
+        note(s, status == 0x0Cu ? "auth deferred" : "auth ok", status);
         if (s->encrypted) establish_link(s, now_ms, false);
         return;
     }
     if (status != 0x00u) {
         note(s, "auth failed", status);
         disconnect_acl(s, handle);
-        link_failed(s, now_ms);
+        link_failed(s, now_ms, status);
         return;
     }
     establish_link(s, now_ms, true);
@@ -548,6 +784,12 @@ static void on_auth_complete(bt_pair_session_t *s, const uint8_t *p, uint64_t no
 static void on_encryption_change(bt_pair_session_t *s, const uint8_t *p, uint64_t now_ms) {
     const uint8_t status = p[0];
     const uint16_t handle = (uint16_t)(hci_get_le16(p + 1) & 0x0FFFu);
+    if (handle == s->second.acl_handle && s->second.active) {
+        s->second.encrypted = status == 0x00u && p[3] != 0;
+        note(s, "second encrypt", status);
+        if (s->second.encrypted && s->second.state == BT_PAIR_AUTH) second_establish(s);
+        return;
+    }
     if (handle != s->acl_handle) return;
     s->encrypted = status == 0x00u && p[3] != 0;
     note(s, "encrypt", status);
@@ -558,20 +800,30 @@ static void on_encryption_change(bt_pair_session_t *s, const uint8_t *p, uint64_
 static void on_disconnection_complete(bt_pair_session_t *s, const uint8_t *p, uint64_t now_ms) {
     const uint16_t handle = (uint16_t)(hci_get_le16(p + 1) & 0x0FFFu);
     const uint8_t reason = p[3];
+    if (s->second.active && s->second.acl_handle != ACL_NONE && handle == s->second.acl_handle) {
+        note(s, "second down", reason);
+        second_fail(s, now_ms, reason);
+        return;
+    }
     if (s->acl_handle == ACL_NONE || handle != s->acl_handle) return;
 
     if (s->state == BT_PAIR_CONNECTED && s->established) {
+        const bool for_scan = s->scan_hold;
         clear_link(s);
         s->state = BT_PAIR_IDLE;
-        if (reason != HCI_REASON_LOCAL) {
+        if (!for_scan && reason != HCI_REASON_LOCAL) {
             const bt_phase1_context_t ctx = { .event = BT_PHASE1_EV_DS4_DISCONNECT };
             const bt_phase1_decision_t d = bt_phase1_decide(&ctx);
             publish(s, d.phrase_id, d.player);
         }
+        if (for_scan) {
+            begin_held_scan(s);
+            return;
+        }
         arm_retry(s, now_ms);
         return;
     }
-    link_failed(s, now_ms); /* caiu antes de autenticar */
+    link_failed(s, now_ms, 0); /* caiu antes de autenticar */
 }
 
 void bt_pair_session_on_event(bt_pair_session_t *s, const uint8_t *evt, size_t len,
@@ -589,10 +841,15 @@ void bt_pair_session_on_event(bt_pair_session_t *s, const uint8_t *evt, size_t l
     case HCI_EVT_COMMAND_STATUS: {
         hci_cmd_status_t cs;
         if (hci_parse_command_status(evt, len, &cs) == 0 &&
-            cs.opcode == HCI_OP_CREATE_CONNECTION && cs.status != 0x00u &&
-            s->state == BT_PAIR_CONNECTING) {
-            note(s, "create connection refused", cs.status);
-            link_failed(s, now_ms);
+            cs.opcode == HCI_OP_CREATE_CONNECTION && cs.status != 0x00u) {
+            if (cs.status == 0x0Bu) release_orphan(s, s->orphan_handle);
+            if (s->state == BT_PAIR_CONNECTING) {
+                note(s, "create connection refused", cs.status);
+                link_failed(s, now_ms, cs.status);
+            } else if (s->second.state == BT_PAIR_CONNECTING) {
+                note(s, "second create refused", cs.status);
+                second_fail(s, now_ms, cs.status);
+            }
         }
         break;
     }
@@ -674,4 +931,5 @@ void bt_pair_session_tick(bt_pair_session_t *s, uint64_t now_ms) {
         now_ms >= s->retry_at_ms) {
         connect_stored(s);
     }
+    if (s->second.retry_armed && now_ms >= s->second.retry_at_ms) page_second(s);
 }

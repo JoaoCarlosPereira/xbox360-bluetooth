@@ -11,8 +11,45 @@
 #define PPC_BCCTR(bo, bi, lk)  ((19u << 26) | ((uint32_t)(bo) << 21) | ((uint32_t)(bi) << 16) | (528u << 1) | ((uint32_t)(lk) & 1u))
 #define PPC_STD(rs, disp, ra)  ((62u << 26) | ((uint32_t)(rs) << 21) | ((uint32_t)(ra) << 16) | ((uint32_t)(disp) & 0xFFFFu))
 #define PPC_LD(rd, disp, ra)   ((58u << 26) | ((uint32_t)(rd) << 21) | ((uint32_t)(ra) << 16) | ((uint32_t)(disp) & 0xFFFFu))
+/* mfspr rd, 9 (CTR). O campo SPR vai com as metades trocadas, como no mtctr. */
+#define PPC_MFCTR(rd)          ((31u << 26) | ((uint32_t)(rd) << 21) | ((9u << 5) << 11) | (339u << 1))
+/* mtspr 8 (LR). */
+#define PPC_MTLR(rs)           ((31u << 26) | ((uint32_t)(rs) << 21) | ((8u << 5) << 11) | (467u << 1))
+#define PPC_BLR()              0x4E800020u
 
 #define PRESERVE_SLOT (-0x30)
+#define CTR_SLOT       (-0x38)
+
+/* mfspr rd, 8: o LR ja foi copiado para um registrador. Sem isso o retorno nao pode usar o LR. */
+static bool insn_is_mflr(uint32_t insn) {
+    return (insn & 0xFC1FFFFFu) == 0x7C0802A6u;
+}
+
+static bool prologue_saved_lr(const uint32_t *insns) {
+    for (size_t i = 0; i < PPC_DETOUR_HOOK_WORDS; i++) {
+        if (insn_is_mflr(insns[i])) return true;
+    }
+    return false;
+}
+
+/* Volta para o resto da funcao sem perder o CTR. O mflr das instrucoes copiadas ja guardou o LR. */
+static size_t ppc_write_lr_return(uint32_t *dst, uint32_t target) {
+    const uint32_t hi = target >> 16;
+    const uint32_t lo = target & 0xFFFFu;
+    size_t n = 0;
+    if (!dst) return 10u;
+    dst[n++] = PPC_STD(0u, CTR_SLOT, 1u);
+    dst[n++] = PPC_MFCTR(0u);
+    dst[n++] = PPC_STD(0u, PRESERVE_SLOT, 1u);
+    dst[n++] = PPC_LIS(0u, hi);
+    dst[n++] = PPC_ORI(0u, 0u, lo);
+    dst[n++] = PPC_MTLR(0u);
+    dst[n++] = PPC_LD(0u, PRESERVE_SLOT, 1u);
+    dst[n++] = PPC_MTCTR(0u);
+    dst[n++] = PPC_LD(0u, CTR_SLOT, 1u);
+    dst[n++] = PPC_BLR();
+    return n;
+}
 
 size_t ppc_write_far_branch(uint32_t *dst, uint32_t target, bool linked, bool preserve,
                             uint32_t branch_options, uint8_t cr_bit, uint8_t reg) {
@@ -65,15 +102,17 @@ bool ppc_detour_install(ppc_detour_t *d, uint32_t *source, uint32_t source_addr,
                         size_t tramp_cap, size_t *tramp_used, ppc_flush_fn flush) {
     if (!d || !source || !tramp || d->installed) return false;
     if (tramp_cap < PPC_DETOUR_TRAMPOLINE_WORDS) return false;
+    /* Funcao curta do sistema (teclado, perfil): sem mflr o retorno via CTR cai no meio
+     * da funcao seguinte. Nao grava nada. */
+    if (!prologue_saved_lr(source)) return false;
 
     size_t used = 0;
     for (size_t i = 0; i < PPC_DETOUR_HOOK_WORDS; i++) {
         d->original[i] = source[i];
         used += ppc_copy_instruction(tramp + used, source + i, source_addr + (uint32_t)(4u * i));
     }
-    /* O trampolim volta para depois do desvio; r0 e preservado, como no hiddriver. */
-    used += ppc_write_far_branch(tramp + used, source_addr + 4u * PPC_DETOUR_HOOK_WORDS,
-                                 false, true, PPC_BRANCH_OPTIONS_ALWAYS, 0u, 0u);
+    /* LR leva o retorno; o CTR que a funcao armou nas 4 instrucoes continua valido. */
+    used += ppc_write_lr_return(tramp + used, source_addr + 4u * PPC_DETOUR_HOOK_WORDS);
     if (flush) flush(tramp, used * sizeof(uint32_t));
 
     d->source = source;

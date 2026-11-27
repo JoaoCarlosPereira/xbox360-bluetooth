@@ -1,5 +1,7 @@
 #include "x360_pad_inject.h"
 
+#include <string.h>
+
 /* Escrita do estado publicado: seq impar enquanto muda, par quando coerente. */
 static void begin_write(x360_pad_inject_t *p) {
     __atomic_store_n(&p->seq, p->seq + 1u, __ATOMIC_RELEASE);
@@ -27,6 +29,49 @@ void x360_pad_inject_init(x360_pad_inject_t *p, const x360_pad_sink_t *sink) {
     p->last = (x360_gamepad_state_t){ 0 };
 }
 
+/* Mesma zona do controle oficial. A Aurora rola a capa com o analógico. */
+#define X360_PAD_LEFT_DEADZONE  7849
+#define X360_PAD_RIGHT_DEADZONE 8689
+
+static uint32_t isqrt_u64(uint64_t n) {
+    uint64_t r = 0;
+    uint64_t bit = 1ull << 62;
+    while (bit > n) bit >>= 2;
+    while (bit != 0u) {
+        if (n >= r + bit) {
+            n -= r + bit;
+            r = (r >> 1) + bit;
+        } else {
+            r >>= 1;
+        }
+        bit >>= 2;
+    }
+    return (uint32_t)r;
+}
+
+/* Centro vira zero. Fora da zona, o curso restante ocupa o eixo inteiro. */
+static void calm_stick(int16_t *x, int16_t *y, int32_t dead) {
+    const int64_t lx = *x;
+    const int64_t ly = *y;
+    const uint64_t mag2 = (uint64_t)(lx * lx + ly * ly);
+    const uint32_t mag = isqrt_u64(mag2);
+    int32_t neu;
+    if (mag <= (uint32_t)dead) {
+        *x = 0;
+        *y = 0;
+        return;
+    }
+    if (mag >= 32767u) return;
+    neu = (int32_t)(((int64_t)(mag - (uint32_t)dead) * 32767) / (32767 - dead));
+    *x = (int16_t)(lx * neu / (int32_t)mag);
+    *y = (int16_t)(ly * neu / (int32_t)mag);
+}
+
+static void calm_pad(x360_gamepad_state_t *pad) {
+    calm_stick(&pad->thumb_lx, &pad->thumb_ly, X360_PAD_LEFT_DEADZONE);
+    calm_stick(&pad->thumb_rx, &pad->thumb_ry, X360_PAD_RIGHT_DEADZONE);
+}
+
 bool x360_pad_inject_publish(x360_pad_inject_t *p, bool authenticated, uint8_t player,
                              const x360_gamepad_state_t *state, bool ps_pressed) {
     if (!p || !state || !p->sink.write_slot) return false;
@@ -38,6 +83,11 @@ bool x360_pad_inject_publish(x360_pad_inject_t *p, bool authenticated, uint8_t p
 
     x360_gamepad_state_t out = *state;
     if (ps_pressed) out.buttons = (uint16_t)(out.buttons | X360_BTN_GUIDE);
+    calm_pad(&out);
+    /* O pacote oficial só muda quando o estado muda. Publicar igual a cada
+     * 10 ms fazia um toque na seta avançar uma capa por leitura. */
+    if (p->active && p->player == player && memcmp(&out, &p->last, sizeof out) == 0)
+        return true;
 
     p->sink.write_slot(p->sink.ctx, (uint8_t)(player - 1u), &out);
     begin_write(p);

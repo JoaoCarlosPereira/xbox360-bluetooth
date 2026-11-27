@@ -21,8 +21,9 @@ extern "C" {
 
 /* O desvio ocupa 4 instrucoes: lis, ori, mtctr, bcctr. */
 #define PPC_DETOUR_HOOK_WORDS 4u
-/* Pior caso do trampolim: 4 instrucoes realocadas (6 palavras cada) + retorno (6). */
-#define PPC_DETOUR_TRAMPOLINE_WORDS 30u
+/* Pior caso do trampolim: 4 instrucoes realocadas (6 palavras cada) + retorno que
+ * preserva o CTR (10). O retorno antigo usava o CTR e derrubava funcoes curtas do sistema. */
+#define PPC_DETOUR_TRAMPOLINE_WORDS 34u
 
 #define PPC_BRANCH_OPTIONS_ALWAYS 20u
 
@@ -51,8 +52,11 @@ size_t ppc_copy_instruction(uint32_t *dst, const uint32_t *src, uint32_t src_add
  * Instala o desvio em source (endereco de execucao source_addr) para target_addr.
  * O trampolim (tramp, executavel em tramp_addr, tramp_cap palavras livres) recebe as 4
  * primeiras instrucoes da funcao e o retorno para source_addr + 16; tramp_addr passa a ser
- * o "original" chamavel. Primeiro o trampolim e esvaziado do cache, depois o desvio e escrito.
- * Retorna false se ja instalado, se os argumentos forem invalidos ou se faltar espaco.
+ * o "original" chamavel. O retorno usa LR e devolve o CTR, entao a funcao so e desviada se
+ * uma das 4 instrucoes for mflr (o LR original ja esta num registrador). Primeiro o trampolim
+ * e esvaziado do cache, depois o desvio e escrito.
+ * Retorna false se ja instalado, se os argumentos forem invalidos, se faltar espaco ou se
+ * a funcao nao guardar o LR nessas 4 instrucoes.
  * *tramp_used recebe as palavras consumidas.
  */
 bool ppc_detour_install(ppc_detour_t *d, uint32_t *source, uint32_t source_addr,
