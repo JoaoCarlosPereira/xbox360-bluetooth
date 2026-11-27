@@ -138,10 +138,29 @@ void dash_rect(float x, float y, float w, float h, uint32_t rgb) {
     quad(x, y, w, h, 1.5f / ATLAS_WIDTH, 1.5f / ATLAS_HEIGHT, 0, 0, rgb);
 }
 
+void dash_border(float x, float y, float w, float h, float t, uint32_t rgb) {
+    if (t <= 0.0f) return;
+    dash_rect(x, y, w, t, rgb);
+    dash_rect(x, y + h - t, w, t, rgb);
+    dash_rect(x, y + t, t, h - 2.0f * t, rgb);
+    dash_rect(x + w - t, y + t, t, h - 2.0f * t, rgb);
+}
+
+void dash_pill(float x, float y, float w, float h, uint32_t rgb) {
+    if (w <= h) {
+        dash_icon(DASH_CIRCLE, x, y, h, rgb);
+        return;
+    }
+    const float r = h * 0.5f;
+    dash_icon(DASH_CIRCLE, x, y, h, rgb);
+    dash_icon(DASH_CIRCLE, x + w - h, y, h, rgb);
+    dash_rect(x + r, y, w - h, h, rgb);
+}
+
 void dash_icon(dash_icon_t icon, float x, float y, float size, uint32_t rgb) {
-    static const float start[] = {768, 76, 132, 196};
-    static const float width[] = {256, 52, 64, 52};
-    static const float height[] = {256, 64, 64, 64};
+    static const float start[]  = {768, 76, 132, 196, 256, 320, 384, 448, 512};
+    static const float width[]  = {256, 52,  64,  52,  64,  64,  64,  64,  64};
+    static const float height[] = {256, 64,  64,  64,  64,  64,  64,  64,  64};
     quad(x, y, size, size, (start[icon] + 0.5f) / ATLAS_WIDTH, 0.5f / ATLAS_HEIGHT,
          (width[icon] - 1) / ATLAS_WIDTH, (height[icon] - 1) / ATLAS_HEIGHT, rgb);
 }
@@ -155,19 +174,39 @@ void dash_art(dash_art_t art, float x, float y, float w, float h, uint32_t rgb) 
          (regions[art].h - 1) / ATLAS_HEIGHT, rgb);
 }
 
+static unsigned next_codepoint(const unsigned char **pp) {
+    const unsigned char *p = *pp;
+    unsigned point = *p++;
+    if (point >= 0xc2 && point <= 0xc3 && (*p & 0xc0) == 0x80) {
+        point = ((point & 0x1f) << 6) | (*p++ & 0x3f);
+    } else if (point >= 128) {
+        while ((*p & 0xc0) == 0x80) p++;
+        point = '?';
+    }
+    if (point < 32) point = ' ';
+    if (point >= 127 && point < 160) point = '?';
+    *pp = p;
+    return point;
+}
+
+float dash_text_width(dash_font_t font, const char *text) {
+    if (!text) return 0.0f;
+    float w = 0.0f;
+    const unsigned char *p = (const unsigned char *)text;
+    while (*p) {
+        const unsigned point = next_codepoint(&p);
+        const Glyph *glyph = &glyphs[font][point < 127 ? point - 32 : point - 65];
+        w += glyph->advance;
+    }
+    return w;
+}
+
 void dash_text(dash_font_t font, float x, float baseline, float max_width, uint32_t rgb, const char *text) {
+    if (!text) return;
     const float limit = x + max_width;
     const unsigned char *p = (const unsigned char *)text;
     while (*p) {
-        unsigned point = *p++;
-        if (point >= 0xc2 && point <= 0xc3 && (*p & 0xc0) == 0x80) {
-            point = ((point & 0x1f) << 6) | (*p++ & 0x3f);
-        } else if (point >= 128) {
-            while ((*p & 0xc0) == 0x80) p++;
-            point = '?';
-        }
-        if (point < 32) point = ' ';
-        if (point >= 127 && point < 160) point = '?';
+        const unsigned point = next_codepoint(&p);
         const Glyph *glyph = &glyphs[font][point < 127 ? point - 32 : point - 65];
         if (x + glyph->advance > limit || x + glyph->left + glyph->width > limit) break;
         if (glyph->width && glyph->height) {

@@ -12,23 +12,49 @@ WIDTH, HEIGHT = 1024, 1024
 FONT_LIMIT = 512
 atlas = Image.new("L", (WIDTH, HEIGHT))
 draw = ImageDraw.Draw(atlas)
+
+# 0: Solid white texel for dash_rect
 draw.rectangle((0, 0, 3, 3), fill=255)
+
+# 1: High-res circle for status dots, Xbox button circles, and dash_pill caps
 draw.ellipse((768, 0, 1023, 255), fill=255)
+
+# 2: Bluetooth icon (x=76, w=52, h=64)
 draw.line([(105, 5), (105, 58), (124, 42), (85, 19)], fill=255, width=5)
 draw.line([(85, 45), (124, 21), (105, 5)], fill=255, width=5)
+
+# 3: Gamepad icon (x=132, w=64, h=64)
 draw.rounded_rectangle((136, 14, 193, 50), radius=14, outline=255, width=4)
 draw.line((146, 32, 161, 32), fill=255, width=4)
 draw.line((153, 25, 153, 39), fill=255, width=4)
 draw.ellipse((174, 26, 179, 31), fill=255)
 draw.ellipse((181, 34, 186, 39), fill=255)
+
+# 4: Search magnifying glass icon (x=196, w=52, h=64)
 draw.ellipse((207, 9, 242, 44), outline=255, width=5)
 draw.line((212, 40, 199, 55), fill=255, width=7)
+
+# 5..9: Xbox 360 Ring of Light (base 4-segment ring + Q1..Q4 individual quadrants, 64x64 each)
+# Pillow arc angles: 0=3h, 90=6h, 180=9h, 270=12h (clockwise).
+ROL_ARCS = (
+    (190, 260),  # Q1: Jogador 1 (top-left)
+    (280, 350),  # Q2: Jogador 2 (top-right)
+    (100, 170),  # Q3: Jogador 3 (bottom-left)
+    (10, 80),    # Q4: Jogador 4 (bottom-right)
+)
+# Base ring at x=256 (all 4 quadrants)
+for a0, a1 in ROL_ARCS:
+    draw.arc((260, 4, 316, 60), start=a0, end=a1, fill=255, width=8)
+# Individual quadrants at x=320, 384, 448, 512
+for idx, (a0, a1) in enumerate(ROL_ARCS):
+    ox = 320 + idx * 64
+    draw.arc((ox + 4, 4, ox + 60, 60), start=a0, end=a1, fill=255, width=9)
 
 folder = Path(__file__).parent
 glyphs = []
 x, y, row_height = 0, 66, 0
 points = (*range(32, 127), *range(160, 256))
-for file, size in (("Lato-Regular.ttf", 20), ("Lato-Heavy.ttf", 25), ("Lato-Heavy.ttf", 48)):
+for file, size in (("Lato-Regular.ttf", 20), ("Lato-Heavy.ttf", 24), ("Lato-Heavy.ttf", 48)):
     font = ImageFont.truetype(folder / file, size)
     face = []
     for point in points:
@@ -55,10 +81,6 @@ def add_mask(position, size, sample):
     atlas.paste(Image.frombytes("L", size, values), position)
 
 
-def silver(x, y):
-    return 0.13 + 0.59 * exp(-((x - 0.46) / 0.73)**2 - ((y - 0.65) / 0.42)**2)
-
-
 def ribbon(x, y):
     center = 1.21 - 0.88 * x + 0.12 * sin(5 * x)
     broad = 0.62 * exp(-((y - center) / 0.22)**2)
@@ -66,13 +88,7 @@ def ribbon(x, y):
     return (broad + crest) * x**1.3
 
 
-def gleam(_, y):
-    return 0.7 * (1 - y)**1.35
-
-
-add_mask((0, 512), (512, 288), silver)
 add_mask((512, 512), (512, 288), ribbon)
-add_mask((0, 800), (8, 128), gleam)
 
 with Path(sys.argv[1]).open("w") as output:
     print(f"enum {{ ATLAS_WIDTH = {WIDTH}, ATLAS_HEIGHT = {HEIGHT} }};", file=output)
