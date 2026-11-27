@@ -125,6 +125,11 @@ uint32_t x360_pad_inject_filter_read_state(const x360_pad_inject_t *p, bool cont
                                            uint32_t original_status, uint32_t *packet_number,
                                            x360_gamepad_state_t *gamepad);
 
+/* Leitura do usuário 0. Com o controle oficial presente, os botões dele permanecem
+ * e os do DS4 entram junto. Sem o oficial, o DS4 ocupa a leitura. O Guide do DS4 sai. */
+void x360_pad_overlay_player1(x360_gamepad_state_t *slot, const x360_gamepad_state_t *ds4,
+                              bool official_present);
+
 /*
  * Contexto do DS4 no XAM (hiddriver360 main.cpp:498-501 e 1204): XamUserBindDeviceCallback
  * recebe controllerId = 0xA7553952 + indice e context = 0x10000005 + indice. Um unico DS4
