@@ -760,9 +760,13 @@ static void test_stored_controller_calling_in_is_not_already_paired(void) {
     assert(count_op(&r.m, HCI_OP_REJECT_CONN_REQ) == 0);
     assert(r.m.nnotified == 0);
     feed(&r, e, evt_conn_complete(e, 0, 0x0002u, ADDR_B), 4000 + BT_PAIR_LISTEN_MS);
-    feed(&r, e, evt_auth_complete(e, 0, 0x0002u), 4001 + BT_PAIR_LISTEN_MS);
-    const cmd_rec_t *enc = last_op(&r.m, HCI_OP_SET_CONN_ENCRYPT);
-    assert(enc && enc->params[2] == 0x01u);
+    /* Reconexão iniciada pelo DS4 não disputa AUTH/ENCRYPT com o controle. */
+    assert(count_op(&r.m, HCI_OP_AUTH_REQUESTED) == 0);
+    assert(count_op(&r.m, HCI_OP_SET_CONN_ENCRYPT) == 0);
+    feed(&r, e, evt_addr_only(e, HCI_EVT_LINK_KEY_REQUEST, ADDR_B, 0), 4001 + BT_PAIR_LISTEN_MS);
+    assert(count_op(&r.m, HCI_OP_LINK_KEY_REQ_REPLY) == 1);
+    feed(&r, e, evt_encrypt(e, 0, 0x0002u, 1), 4002 + BT_PAIR_LISTEN_MS);
+    assert(r.s.second.established && r.s.second.encrypted);
     assert(count_op(&r.m, HCI_OP_DISCONNECT) == 0);
     printf("[PASS] controle gravado que liga sozinho entra sem aviso de ja pareado\n");
 }
@@ -833,6 +837,80 @@ static void test_idle_fifteen_minutes(void) {
     printf("[PASS] 15 min parado desliga e o PS liga de novo\n");
 }
 
+static void test_event_mask_fallback_in_setup(void) {
+    rig_t r;
+    uint8_t e[16];
+    rig_init(&r, false);
+    bt_pair_session_adapter_ready(&r.s, 0);
+    assert(count_op(&r.m, HCI_OP_SET_EVENT_MASK) == 1);
+    const cmd_rec_t *first = last_op(&r.m, HCI_OP_SET_EVENT_MASK);
+    assert(first && first->len == 8 && first->params[5] == 0xF8u && first->params[7] == 0x00u);
+
+    /* Clone rejeita mascara BT 2.1+ com 0x12 -> cai para mascara minima antes de liberar setup. */
+    e[0] = HCI_EVT_COMMAND_COMPLETE; e[1] = 4; e[2] = 1;
+    hci_put_le16(e + 3, HCI_OP_SET_EVENT_MASK); e[5] = 0x12u;
+    feed(&r, e, 6, 10);
+    assert(count_op(&r.m, HCI_OP_SET_EVENT_MASK) == 2);
+    const cmd_rec_t *second = last_op(&r.m, HCI_OP_SET_EVENT_MASK);
+    assert(second && second->len == 8 && second->params[5] == 0x00u);
+    assert((r.s.setup_pending & BT_PAIR_SETUP_EVENT_MASK) != 0u);
+
+    feed(&r, e, evt_cmd_complete(e, HCI_OP_SET_EVENT_MASK), 20);
+    assert((r.s.setup_pending & BT_PAIR_SETUP_EVENT_MASK) == 0u);
+    printf("[PASS] fallback de Set_Event_Mask no preparo da sessao para clones baratos\n");
+}
+
+static void test_primary_incoming_lets_ds4_encrypt(void) {
+    rig_t r;
+    uint8_t e[32];
+    rig_init(&r, true);
+    bt_pair_session_adapter_ready(&r.s, 0);
+    /* Page timeout deixa o radio em escuta (BT_PAIR_IDLE). */
+    feed(&r, e, evt_conn_complete(e, 0x04, 0, ADDR_A), 1000);
+    assert(r.s.state == BT_PAIR_IDLE);
+    /* DS4 #1 chama sozinho (incoming = true): host responde Link Key e espera Encryption Change. */
+    feed(&r, e, evt_conn_request(e, ADDR_A, 0x002508u), 2000);
+    assert(r.s.incoming && r.s.state == BT_PAIR_CONNECTING);
+    feed(&r, e, evt_conn_complete(e, 0, 0x0001u, ADDR_A), 2010);
+    assert(r.s.state == BT_PAIR_AUTH);
+    assert(count_op(&r.m, HCI_OP_AUTH_REQUESTED) == 0);
+    assert(count_op(&r.m, HCI_OP_SET_CONN_ENCRYPT) == 0);
+    feed(&r, e, evt_addr_only(e, HCI_EVT_LINK_KEY_REQUEST, ADDR_A, 0), 2015);
+    assert(count_op(&r.m, HCI_OP_LINK_KEY_REQ_REPLY) == 1);
+    feed(&r, e, evt_encrypt(e, 0, 0x0001u, 1), 2030);
+    assert(r.s.established && r.s.encrypted && r.s.state == BT_PAIR_CONNECTED);
+    printf("[PASS] DS4 primario que entra sozinho conclui cifra sem colisao LMP\n");
+}
+
+static void test_both_ds4_turning_on_while_paging_b(void) {
+    rig_t r;
+    static const uint8_t key_b[16] = { 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9 };
+    uint8_t e[32];
+    rig_init(&r, true);
+    assert(bt_manager_store_single_ds4(&r.ipc, ADDR_B, key_b, 5u, 2u, "DS4B") >= 0);
+    bt_pair_session_adapter_ready(&r.s, 0);
+    /* Page A times out -> next turn pages B on primary. */
+    feed(&r, e, evt_conn_complete(e, 0x04, 0, ADDR_A), 1000);
+    bt_pair_session_tick(&r.s, 1000 + BT_PAIR_LISTEN_MS);
+    assert(r.s.state == BT_PAIR_CONNECTING && memcmp(r.s.peer, ADDR_B, 6) == 0);
+
+    /* Both turn on together: A calls in while primary is paging B -> A takes second! */
+    feed(&r, e, evt_conn_request(e, ADDR_A, 0x002508u), 1050 + BT_PAIR_LISTEN_MS);
+    assert(memcmp(r.s.peer, ADDR_B, 6) == 0);
+    assert(r.s.second.active && memcmp(r.s.second.peer, ADDR_A, 6) == 0);
+
+    /* Both complete, authenticate, encrypt, and stay up with zero disconnects. */
+    feed(&r, e, evt_conn_complete(e, 0, 0x0001u, ADDR_B), 1100 + BT_PAIR_LISTEN_MS);
+    feed(&r, e, evt_conn_complete(e, 0, 0x0002u, ADDR_A), 1110 + BT_PAIR_LISTEN_MS);
+    feed(&r, e, evt_auth_complete(e, 0, 0x0001u), 1120 + BT_PAIR_LISTEN_MS);
+    feed(&r, e, evt_encrypt(e, 0, 0x0001u, 1), 1130 + BT_PAIR_LISTEN_MS);
+    feed(&r, e, evt_auth_complete(e, 0, 0x0002u), 1140 + BT_PAIR_LISTEN_MS);
+    feed(&r, e, evt_encrypt(e, 0, 0x0002u, 1), 1150 + BT_PAIR_LISTEN_MS);
+    assert(r.s.established && r.s.second.established);
+    assert(count_op(&r.m, HCI_OP_DISCONNECT) == 0);
+    printf("[PASS] os dois DS4 ligando juntos durante pagina de B sobem sem derrubar um ao outro\n");
+}
+
 int main(void) {
     test_par_05_reconnect_without_inquiry();
     test_link_key_reply_with_stored_key();
@@ -861,5 +939,8 @@ int main(void) {
     test_scan_waits_until_both_links_drop();
     test_pair_command_ignored_without_adapter();
     test_idle_fifteen_minutes();
+    test_event_mask_fallback_in_setup();
+    test_primary_incoming_lets_ds4_encrypt();
+    test_both_ds4_turning_on_while_paging_b();
     return 0;
 }
