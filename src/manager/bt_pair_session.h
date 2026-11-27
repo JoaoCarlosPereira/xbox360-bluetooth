@@ -30,6 +30,8 @@ extern "C" {
 #define BT_PAIR_INQUIRY_UNITS      48u
 /* Espera entre tentativas de reconexao ao DS4 gravado. */
 #define BT_PAIR_RECONNECT_RETRY_MS 3000u
+/* Depois de uma pagina que ninguem atendeu, o radio fica so escutando. */
+#define BT_PAIR_LISTEN_MS          20000u
 /* Intervalo minimo entre avisos de "ja existe um DualShock 4" (PAR-03). */
 #define BT_PAIR_SECOND_DS4_MS      10000u
 
