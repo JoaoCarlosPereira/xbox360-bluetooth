@@ -26,8 +26,22 @@ static void test_adp_03_wrong_adapter(void)
     bt_phase1_decision_t d = bt_phase1_decide(&ctx);
     assert(d.phrase_id == BT_PHRASE_ADAPTER_WRONG);
     assert(strcmp(bt_phase1_phrase_text(d.phrase_id),
-                 "Este adaptador não faz parte desta entrega.") == 0);
-    printf("[PASS] ADP-03 adaptador errado\n");
+                 "Adaptador Bluetooth incompatível.") == 0);
+    printf("[PASS] ADP-03 adaptador incompativel\n");
+}
+
+static void test_adp_04_fw_missing(void)
+{
+    const bt_phase1_context_t ctx = {
+        .event   = BT_PHASE1_EV_ADAPTER,
+        .adapter = BT_PHASE1_ADAPTER_FW_MISSING,
+    };
+    bt_phase1_decision_t d = bt_phase1_decide(&ctx);
+    assert(d.phrase_id == BT_PHRASE_ADAPTER_FW_MISSING);
+    assert(strcmp(bt_phase1_phrase_text(d.phrase_id),
+                 "Firmware do adaptador ausente no USB.") == 0);
+    assert(!bt_phase1_is_adapter_state_phrase(BT_PHRASE_ADAPTER_FW_MISSING));
+    printf("[PASS] ADP-04 firmware ausente no USB\n");
 }
 
 static void test_sta_01_adapter_state_phrases(void)
@@ -271,7 +285,9 @@ static void test_phrase_bounds_and_null_decide(void)
                   "DualShock 4 pareado no Jogador 3") == 0);
     assert(strcmp(bt_phase1_phrase_text(BT_PHRASE_DS4_PAIRED_PLAYER4),
                   "DualShock 4 pareado no Jogador 4") == 0);
-    assert(bt_phase1_phrase_text((uint32_t)BT_PHRASE_DS4_PAIRED_PLAYER4 + 1u) == NULL);
+    assert(strcmp(bt_phase1_phrase_text(BT_PHRASE_ADAPTER_FW_MISSING),
+                  "Firmware do adaptador ausente no USB.") == 0);
+    assert(bt_phase1_phrase_text((uint32_t)BT_PHRASE_ADAPTER_FW_MISSING + 1u) == NULL);
     assert(bt_phase1_phrase_text(0xFFFFFFFFu) == NULL);
 
     bt_phase1_decision_t d = bt_phase1_decide(NULL);
@@ -340,6 +356,7 @@ int main(void)
 {
     test_adp_02_no_ugreen();
     test_adp_03_wrong_adapter();
+    test_adp_04_fw_missing();
     test_sta_01_adapter_state_phrases();
     test_par_01_official_player2();
     test_par_02_no_official_player1();
