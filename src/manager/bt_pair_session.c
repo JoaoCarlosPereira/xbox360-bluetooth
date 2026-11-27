@@ -485,8 +485,9 @@ void bt_pair_session_adapter_ready(bt_pair_session_t *s, uint64_t now_ms) {
     second_clear(s);
     s->adapter_ready = true;
     s->setup_pending = BT_PAIR_SETUP_ALL;
+    s->event_mask_fallback = false;
 
-    static const uint8_t event_mask[8] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F };
+    static const uint8_t event_mask[8] = HCI_EVENT_MASK_CLASSIC_SSP_INIT;
     static const uint8_t ssp_on = 0x01;
     static const uint8_t page_timeout[2] = { 0x00, 0x40 }; /* 0x4000 * 0,625 ms = 10,24 s */
     static const uint8_t page_scan_only = 0x02;
@@ -656,7 +657,15 @@ static void on_command_complete(bt_pair_session_t *s, const uint8_t *evt, size_t
     hci_cmd_complete_t cc;
     if (hci_parse_command_complete(evt, len, &cc) != 0) return;
     switch (cc.opcode) {
-    case HCI_OP_SET_EVENT_MASK:       s->setup_pending &= (uint8_t)~BT_PAIR_SETUP_EVENT_MASK; break;
+    case HCI_OP_SET_EVENT_MASK:
+        if (cc.params_len >= 1u && cc.params[0] != 0x00u && !s->event_mask_fallback) {
+            static const uint8_t legacy_mask[8] = HCI_EVENT_MASK_LEGACY_INIT;
+            s->event_mask_fallback = true;
+            send_cmd(s, HCI_OP_SET_EVENT_MASK, legacy_mask, sizeof legacy_mask);
+            return;
+        }
+        s->setup_pending &= (uint8_t)~BT_PAIR_SETUP_EVENT_MASK;
+        break;
     case HCI_OP_WRITE_SIMPLE_PAIRING: s->setup_pending &= (uint8_t)~BT_PAIR_SETUP_SSP;        break;
     case HCI_OP_WRITE_PAGE_TIMEOUT:   s->setup_pending &= (uint8_t)~BT_PAIR_SETUP_PAGE_TO;    break;
     case HCI_OP_WRITE_SCAN_ENABLE:    s->setup_pending &= (uint8_t)~BT_PAIR_SETUP_SCAN;       break;
@@ -681,8 +690,7 @@ static void on_connection_request(bt_pair_session_t *s, const uint8_t *p, uint64
     if (known && primary_this &&
         (s->state == BT_PAIR_IDLE || s->state == BT_PAIR_CONNECTING)) {
         accept = true;
-    } else if (stored && addr_eq(addr, stored) &&
-               (s->state == BT_PAIR_IDLE || s->state == BT_PAIR_CONNECTING)) {
+    } else if (stored && addr_eq(addr, stored) && s->state == BT_PAIR_IDLE) {
         accept = true;
     } else if (s->pair_active && s->state == BT_PAIR_SCANNING && ds4_like &&
                (!s->has_target || addr_eq(addr, s->target)) &&
@@ -742,9 +750,13 @@ static void on_connection_complete(bt_pair_session_t *s, const uint8_t *p, uint6
         }
         s->second.acl_handle = handle;
         s->second.state = BT_PAIR_AUTH;
-        uint8_t auth2[2];
-        hci_put_le16(auth2, handle);
-        send_cmd(s, HCI_OP_AUTH_REQUESTED, auth2, sizeof auth2);
+        /* Na reconexão iniciada pelo DS4 (incoming), o próprio controle inicia
+         * auth + cifra; mandar AUTH_REQUESTED do host causa colisão LMP e reason=13. */
+        if (!s->second.incoming) {
+            uint8_t auth2[2];
+            hci_put_le16(auth2, handle);
+            send_cmd(s, HCI_OP_AUTH_REQUESTED, auth2, sizeof auth2);
+        }
         return;
     }
     if (!s->has_peer || !addr_eq(addr, s->peer) || s->state != BT_PAIR_CONNECTING) {
@@ -759,9 +771,11 @@ static void on_connection_complete(bt_pair_session_t *s, const uint8_t *p, uint6
     }
     s->acl_handle = handle;
     s->state = BT_PAIR_AUTH;
-    uint8_t auth[2];
-    hci_put_le16(auth, handle);
-    send_cmd(s, HCI_OP_AUTH_REQUESTED, auth, sizeof auth);
+    if (!s->incoming || s->pair_active) {
+        uint8_t auth[2];
+        hci_put_le16(auth, handle);
+        send_cmd(s, HCI_OP_AUTH_REQUESTED, auth, sizeof auth);
+    }
 }
 
 static void on_link_key_request(bt_pair_session_t *s, const uint8_t *addr) {
@@ -813,15 +827,8 @@ static void on_auth_complete(bt_pair_session_t *s, const uint8_t *p, uint64_t no
     const uint16_t handle = (uint16_t)(hci_get_le16(p + 1) & 0x0FFFu);
     if (s->second.state == BT_PAIR_AUTH && handle == s->second.acl_handle) {
         if (status == 0x0Cu || status == 0x00u) {
-            note(s, status == 0x0Cu ? "second auth deferred" : "second auth ok", status);
             if (s->second.encrypted) second_establish(s, now_ms);
-            else if (status == 0x00u && s->second.incoming) {
-                /* Quem entra não cifra sozinho. Sem este pedido o DS4 cai com 0x13. */
-                uint8_t enc[3];
-                hci_put_le16(enc, handle);
-                enc[2] = 0x01u;
-                send_cmd(s, HCI_OP_SET_CONN_ENCRYPT, enc, sizeof enc);
-            }
+            note(s, status == 0x0Cu ? "second auth deferred" : "second auth ok", status);
             return;
         }
         note(s, "second auth failed", status);
@@ -835,8 +842,8 @@ static void on_auth_complete(bt_pair_session_t *s, const uint8_t *p, uint64_t no
      * 0x00 na reconexão: a cifragem chega sozinha. Pedir Set Connection Encryption
      * nesse instante faz o DS4 cair com reason 0x13. O pareamento novo ainda pede. */
     if (status == 0x0Cu || (status == 0x00u && !s->pair_active)) {
-        note(s, status == 0x0Cu ? "auth deferred" : "auth ok", status);
         if (s->encrypted) establish_link(s, now_ms, false);
+        note(s, status == 0x0Cu ? "auth deferred" : "auth ok", status);
         return;
     }
     if (status != 0x00u) {
