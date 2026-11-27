@@ -91,6 +91,7 @@ typedef struct {
 
     bool            adapter_ready;
     uint8_t         setup_pending;
+    bool            event_mask_fallback;
 
     bt_pair_state_t state;
     bool            pair_active;     /* publicado em bt_console_reply_t */
