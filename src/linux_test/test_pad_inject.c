@@ -561,6 +561,62 @@ static void test_ppc_04_install_guards(void) {
     printf("[PASS] PPC-04 argumentos invalidos ou trampolim pequeno nao tocam a funcao\n");
 }
 
+static void test_ppc_06_short_body_is_copied_whole(void) {
+    uint32_t fn[10];
+    uint32_t tramp[PPC_DETOUR_TRAMPOLINE_WORDS];
+    ppc_detour_t d;
+    size_t used = 0;
+    memset(&d, 0, sizeof d);
+    memset(tramp, 0, sizeof tramp);
+    fn[0] = 0x3D60800Eu;
+    fn[1] = 0x816B0000u;
+    fn[2] = 0x7D6903A6u;
+    for (int i = 3; i < 9; i++) fn[i] = 0x60000000u;
+    fn[9] = 0x4E800420u;
+    assert(ppc_detour_install_body(&d, fn, 0x816F4AB8u, 0x91441000u, tramp, 0x91450000u,
+                                   PPC_DETOUR_TRAMPOLINE_WORDS, &used, NULL));
+    assert(d.installed && used == 10u);
+    assert(tramp[0] == 0x3D60800Eu && tramp[2] == 0x7D6903A6u && tramp[9] == 0x4E800420u);
+    assert(tramp[10] == 0u);
+    assert(fn[0] != 0x3D60800Eu);
+    printf("[PASS] PPC-06 corpo curto do teclado e copiado inteiro, sem salto de volta\n");
+}
+
+static void test_ppc_05_long_function_without_mflr_uses_ctr(void) {
+    uint32_t fn[8] = { 0x9421FF90u, 0x7C7B1B78u, 0x7C9C2378u, 0x7CBD2B78u, 0x7C0802A6u, 0, 0, 0 };
+    uint32_t tramp[PPC_DETOUR_TRAMPOLINE_WORDS];
+    ppc_detour_t d;
+    size_t used = 0;
+    memset(&d, 0, sizeof d);
+    assert(ppc_detour_install(&d, fn, 0x800F6C20u, 0x91441000u, tramp, 0x91450000u,
+                              PPC_DETOUR_TRAMPOLINE_WORDS, &used, NULL));
+    assert(d.installed);
+    assert(used == 4u + 6u);
+    assert(tramp[0] == 0x9421FF90u && tramp[3] == 0x7CBD2B78u);
+    assert(tramp[4] == 0xF801FFD0u && tramp[9] == 0x4E800420u);
+    assert(fn[4] == 0x7C0802A6u);
+    printf("[PASS] PPC-05 funcao longa sem mflr volta pelo CTR e preserva o LR\n");
+}
+
+static void test_overlay_keeps_official_buttons(void) {
+    x360_gamepad_state_t slot = OFFICIAL;
+    slot.thumb_lx = 0;
+    x360_gamepad_state_t ds4;
+    memset(&ds4, 0, sizeof ds4);
+    ds4.buttons = (uint16_t)(X360_BTN_B | X360_BTN_GUIDE);
+    ds4.thumb_lx = 1000;
+    x360_pad_overlay_player1(&slot, &ds4, true);
+    assert((slot.buttons & OFFICIAL.buttons) == OFFICIAL.buttons);
+    assert(slot.buttons & X360_BTN_B);
+    assert((slot.buttons & X360_BTN_GUIDE) == 0);
+    assert(slot.thumb_ly == OFFICIAL.thumb_ly);
+    assert(slot.thumb_lx == 1000);
+    x360_pad_overlay_player1(&slot, &ds4, false);
+    assert(slot.buttons == X360_BTN_B);
+    assert(slot.thumb_lx == 1000);
+    printf("[PASS] leitura do usuario 0 guarda o controle oficial e soma o DS4\n");
+}
+
 int main(void) {
     test_pad_01_no_pairing_no_write();
     test_pad_02_official_on_1_goes_to_2();
@@ -573,6 +629,7 @@ int main(void) {
     test_pad_09_capabilities_filter();
     test_pad_10_set_state_filter();
     test_pad_11_read_state_filter();
+    test_overlay_keeps_official_buttons();
     test_pad_12_bind_verdict_and_context();
     test_pad_13_context_rule();
     test_pad_14_held_direction_is_one_packet();
@@ -581,5 +638,7 @@ int main(void) {
     test_ppc_02_install_plain_function();
     test_ppc_03_relocates_relative_branches();
     test_ppc_04_install_guards();
+    test_ppc_05_long_function_without_mflr_uses_ctr();
+    test_ppc_06_short_body_is_copied_whole();
     return 0;
 }
