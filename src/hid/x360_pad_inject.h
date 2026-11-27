@@ -48,6 +48,8 @@ typedef struct {
     uint8_t              player;      /* 1 ou 2, valido se active */
     uint32_t             packet;      /* sobe a cada publish */
     x360_gamepad_state_t last;        /* ultimo estado publicado (com o bit Guide) */
+    uint16_t             button_level; /* botão estável; um furo no quadro não solta */
+    uint8_t              button_release;
 } x360_pad_inject_t;
 
 typedef struct {
@@ -58,6 +60,9 @@ typedef struct {
 } x360_pad_snapshot_t;
 
 void x360_pad_inject_init(x360_pad_inject_t *p, const x360_pad_sink_t *sink);
+
+/* Botão, gatilho acima do piso ou analógico fora da zona morta. O centro parado não conta. */
+bool x360_pad_in_use(const x360_gamepad_state_t *state);
 
 /*
  * Publica o estado do DS4 no slot do jogador decidido pela sessao.
@@ -183,6 +188,18 @@ typedef struct {
 /* SUCCESS e preenche uma tecla, ou EMPTY quando não há evento neste instante. */
 uint32_t x360_pad_keystroke_next(x360_key_tracker_t *tracker, const x360_gamepad_state_t *state,
                                  uint8_t user_index, uint32_t now_ms, x360_keystroke_t *out);
+
+/* A, B, X ou Y. O teclado do sistema repete esses botões sozinho. 0 se não for um deles. */
+uint16_t x360_pad_face_bit(uint16_t virtual_key);
+
+/*
+ * O teclado lê a tecla do XAM e também o estado somado do DS4. Com o Y preso,
+ * o XAM devolve um toque por pacote. Esse filtro fica com um toque só do DS4
+ * e deixa passar a tecla do controle oficial.
+ */
+uint32_t x360_pad_keystroke_filter(x360_key_tracker_t *tracker, const x360_gamepad_state_t *ds4,
+                                   uint32_t original_status, x360_keystroke_t *key,
+                                   uint8_t user_index, uint32_t now_ms);
 
 #ifdef __cplusplus
 }
