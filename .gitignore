@@ -8,6 +8,7 @@ build/
 *.elf
 *.exe
 *.xex
+!xbox/*.xex
 *.pdb
 src/linux_test/hci_probe
 src/linux_test/test_usb_transport
