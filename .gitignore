@@ -20,3 +20,4 @@ src/linux_test/test_pad_inject
 src/linux_test/test_pair_session
 src/linux_test/test_phase1
 src/linux_test/test_transport_session
+src/linux_test/test_chipset
