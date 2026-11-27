@@ -59,6 +59,7 @@ static x360_gamepad_state_t published_ds4(bool guide) {
     s.thumb_ly = 0;
     s.thumb_rx = 0;
     s.thumb_ry = 0;
+    s.right_trigger = 0; /* abaixo do piso do gatilho */
     if (guide) s.buttons = (uint16_t)(s.buttons | X360_BTN_GUIDE);
     return s;
 }
@@ -315,7 +316,7 @@ static void test_pad_11_read_state_filter(void) {
 
     assert(x360_pad_inject_filter_read_state(&p, true, 0x57u, &packet, &gp) == 0u);
     assert(gp.buttons == (uint16_t)(0x1000u | 0x0001u | 0x0400u)); /* com Guide */
-    assert(gp.left_trigger == 200u && gp.right_trigger == 10u);
+    assert(gp.left_trigger == 200u && gp.right_trigger == 0u);
     assert(gp.thumb_lx == 0 && gp.thumb_ly == 0 && gp.thumb_rx == 0 && gp.thumb_ry == 0);
     assert(packet == 1u);
 
@@ -366,6 +367,32 @@ static void test_pad_14_held_direction_is_one_packet(void) {
     assert(packet == 2u && e.writes[1] == 2);
     assert(gp.thumb_ly > 14000 && gp.thumb_ly < 18000);
     assert(gp.thumb_lx == 0);
+
+    /* Gatilho baixo e um furo do direcional não criam outro passo. */
+    pushed.left_trigger = 200u;
+    pushed.right_trigger = 15u;
+    pushed.buttons = X360_BTN_A;
+    assert(x360_pad_inject_publish(&p, true, 2u, &pushed, false));
+    assert(x360_pad_inject_filter_read_state(&p, true, 0x57u, &packet, &gp) == 0u);
+    assert(packet == 2u);
+    assert((gp.buttons & X360_BTN_DPAD_UP) != 0u);
+    assert(x360_pad_inject_publish(&p, true, 2u, &pushed, false));
+    assert(x360_pad_inject_filter_read_state(&p, true, 0x57u, &packet, &gp) == 0u);
+    assert(packet == 3u);
+    assert((gp.buttons & X360_BTN_DPAD_UP) == 0u);
+
+    /* Tremor do analógico com o Y preso não abre outro pacote. */
+    pushed.buttons = X360_BTN_Y;
+    pushed.thumb_ly = 20000;
+    assert(x360_pad_inject_publish(&p, true, 2u, &pushed, false));
+    assert(x360_pad_inject_filter_read_state(&p, true, 0x57u, &packet, &gp) == 0u);
+    const uint32_t held_packet = packet;
+    pushed.thumb_ly = 21000;
+    pushed.left_trigger = 208u;
+    assert(x360_pad_inject_publish(&p, true, 2u, &pushed, false));
+    assert(x360_pad_inject_filter_read_state(&p, true, 0x57u, &packet, &gp) == 0u);
+    assert(packet == held_packet);
+    assert((gp.buttons & X360_BTN_Y) != 0u);
     printf("[PASS] PAD-14 seta segurada e um pacote; zona morta come o centro\n");
 }
 
@@ -530,15 +557,69 @@ static void test_guide_keystroke(void) {
     assert(x360_pad_keystroke_next(&tracker, &state, 0u, 1300u, &key) == X360_PAD_ERROR_SUCCESS);
     assert(key.virtual_key == 0x5810u && (key.flags & X360_KEY_DOWN) != 0u);
     assert(x360_pad_keystroke_next(&tracker, &state, 0u, 1700u, &key) == X360_PAD_ERROR_EMPTY);
-    assert(x360_pad_keystroke_next(&tracker, &state, 0u, 1760u, &key) == X360_PAD_ERROR_SUCCESS);
+    assert(x360_pad_keystroke_next(&tracker, &state, 0u, 1760u, &key) == X360_PAD_ERROR_EMPTY);
+    assert(x360_pad_keystroke_next(&tracker, &state, 0u, 2000u, &key) == X360_PAD_ERROR_SUCCESS);
     assert(key.virtual_key == 0x5810u && (key.flags & X360_KEY_REPEAT) != 0u);
 
     state.buttons = X360_BTN_GUIDE;
     state.thumb_ly = 0;
-    assert(x360_pad_keystroke_next(&tracker, &state, 0u, 2000u, &key) == X360_PAD_ERROR_SUCCESS);
+    assert(x360_pad_keystroke_next(&tracker, &state, 0u, 2100u, &key) == X360_PAD_ERROR_SUCCESS);
     assert(key.flags == X360_KEY_UP);
-    assert(x360_pad_keystroke_next(&tracker, &state, 0u, 2010u, &key) == X360_PAD_ERROR_EMPTY);
+    assert(x360_pad_keystroke_next(&tracker, &state, 0u, 2200u, &key) == X360_PAD_ERROR_EMPTY);
+
+    /* Y preso é um espaço, não uma rajada. O teclado trava se o Y se repete. */
+    memset(&tracker, 0, sizeof tracker);
+    memset(&state, 0, sizeof state);
+    state.buttons = X360_BTN_Y;
+    assert(x360_pad_keystroke_next(&tracker, &state, 0u, 3000u, &key) == X360_PAD_ERROR_SUCCESS);
+    assert(key.virtual_key == 0x5803u && key.flags == X360_KEY_DOWN);
+    assert(x360_pad_keystroke_next(&tracker, &state, 0u, 9000u, &key) == X360_PAD_ERROR_EMPTY);
+    state.buttons = 0u;
+    assert(x360_pad_keystroke_next(&tracker, &state, 0u, 9100u, &key) == X360_PAD_ERROR_SUCCESS);
+    assert(key.virtual_key == 0x5803u && key.flags == X360_KEY_UP);
+
+    /* O XAM devolve Y a cada leitura enquanto o DS4 segura o botão. */
+    memset(&tracker, 0, sizeof tracker);
+    memset(&state, 0, sizeof state);
+    state.buttons = X360_BTN_Y;
+    key.virtual_key = 0x5803u;
+    key.flags = X360_KEY_DOWN;
+    assert(x360_pad_keystroke_filter(&tracker, &state, 0u, &key, 0u, 4000u) == X360_PAD_ERROR_SUCCESS);
+    assert(key.virtual_key == 0x5803u && key.flags == X360_KEY_DOWN);
+    key.virtual_key = 0x5803u;
+    key.flags = (uint16_t)(X360_KEY_DOWN | X360_KEY_REPEAT);
+    assert(x360_pad_keystroke_filter(&tracker, &state, 0u, &key, 0u, 4010u) == X360_PAD_ERROR_EMPTY);
+    assert(key.virtual_key == 0u);
+    key.virtual_key = 0x5803u;
+    key.flags = X360_KEY_DOWN;
+    assert(x360_pad_keystroke_filter(&tracker, &state, 0u, &key, 0u, 9000u) == X360_PAD_ERROR_EMPTY);
+    state.buttons = 0u;
+    key.virtual_key = 0x5803u;
+    key.flags = X360_KEY_UP;
+    assert(x360_pad_keystroke_filter(&tracker, &state, 0u, &key, 0u, 9100u) == X360_PAD_ERROR_SUCCESS);
+    assert(key.virtual_key == 0x5803u && key.flags == X360_KEY_UP);
+
+    /* A do controle oficial passa, mesmo com o DS4 ligado e parado. */
+    memset(&tracker, 0, sizeof tracker);
+    memset(&state, 0, sizeof state);
+    key.virtual_key = 0x5800u;
+    key.flags = X360_KEY_DOWN;
+    assert(x360_pad_keystroke_filter(&tracker, &state, 0u, &key, 0u, 10000u) == X360_PAD_ERROR_SUCCESS);
+    assert(key.virtual_key == 0x5800u && key.flags == X360_KEY_DOWN);
     printf("[PASS] painel: A, direcional do analogico e o botao central sem tecla\n");
+
+    x360_gamepad_state_t rest = { 0 };
+    assert(!x360_pad_in_use(NULL));
+    assert(!x360_pad_in_use(&rest));
+    rest.thumb_lx = 400;
+    rest.left_trigger = 10;
+    assert(!x360_pad_in_use(&rest));
+    rest.buttons = X360_BTN_Y;
+    assert(x360_pad_in_use(&rest));
+    rest.buttons = 0;
+    rest.thumb_ly = 20000;
+    assert(x360_pad_in_use(&rest));
+    printf("[PASS] parado no centro nao conta como uso\n");
 }
 
 static void test_ppc_04_install_guards(void) {
