@@ -1,47 +1,86 @@
-# Xbox 360 Generic USB Bluetooth (P&D)
+# Bluetooth no Xbox 360
 
-Projeto experimental de pesquisa e desenvolvimento para adicionar suporte genérico a adaptadores **Bluetooth USB (HCI)** diretamente no **Xbox 360** (alvo inicial: Xbox 360 E com desbloqueio **ABadAvatar** + **XeUnshackle** + **Aurora**).
+Este projeto liga um DualShock 4 no Xbox 360 por um adaptador Bluetooth USB. O console passa a enxergar o controle como um controle de Xbox: a Aurora e os jogos recebem os botões, os analógicos, os gatilhos e a vibração. Até dois DualShock 4 funcionam ao mesmo tempo. O controle original do Xbox, quando está ligado, continua no jogador 1.
 
-> **Estado em 26/11/2026:** o protótipo roda no Xbox 360 E. O plugin `bt360_proto.xex` sobe com o DashLaunch, o UGREEN `2B89:8761` (RTL8761BU) fica pronto e até dois DualShock 4 conectam ao mesmo tempo. O controle original permanece no jogador 1. O código está em `main`, commit `7784beb`. A tela nativa de perfil ainda precisa ser confirmada no próximo boot: ela pede teclas (`XamInputGetKeystroke`, ordinal 403), e esse caminho acabou de ir para o HD.
+A pasta [`xbox/`](xbox/) já traz os arquivos prontos. Não é preciso compilar nada para usar no console.
 
----
+## O que dá para fazer
 
-## Resposta à Pergunta Central
+- Parear um DualShock 4 pelo aplicativo Bluetooth e usá-lo na Aurora e nos jogos.
+- Jogar com dois DualShock 4 ao mesmo tempo, cada um num jogador.
+- Guardar até quatro DualShock 4. Nos próximos boots, o controle gravado volta ao apertar PS.
+- Manter o controle original no jogador 1 e deixar os DualShock nos jogadores seguintes.
+- Encaminhar a vibração que o jogo pede para o DualShock.
+- Pedir o guia do Xbox pelo botão PS.
+- Achar qual controle é qual: LB e, no DualShock, segurar SHARE.
+- Trocar o jogador, desconectar ou esquecer um controle pela tela Bluetooth.
+- Desligar sozinho um DualShock parado por 15 minutos. O botão PS liga de novo.
 
-> **É possível, no ambiente de desbloqueio ABadAvatar do Xbox 360, desenvolver uma camada genérica capaz de acessar adaptadores Bluetooth USB e trocar comandos HCI com eles?**
+## Requisitos
 
-**Sim — é tecnicamente viável**, com uma ressalva importante de engenharia reversa pontual para a etapa de *descoberta/bind* do dispositivo no kernel.
+- Xbox 360 com ABadAvatar, XeUnshackle, DashLaunch e Aurora. O teste foi feito no kernel retail `2.0.17559.0`.
+- Disco USB em FAT32, o mesmo de onde a Aurora abre.
+- Adaptador UGREEN `2B89:8761`, com chip Realtek RTL8761BU. Outro adaptador recebe o aviso "Este adaptador não faz parte desta entrega."
+- Um ou dois controles DualShock 4.
+- O controle original é opcional depois do pareamento. Na tela nativa de perfil ("Entrar") ele ainda é o caminho seguro: essa tela está em confirmação nesta versão.
 
-### Evidências principais
-1. **Acesso completo ao barramento USB via kernel (`xboxkrnl.exe`):** O kernel retail `2.0.17559.0` exporta nativamente a pilha `Usbd*` (ordinais 740–759, 892, 895), incluindo `UsbdOpenDefaultEndpoint`, `UsbdOpenEndpoint` (com suporte a Control `0x00`, Isochronous `0x01`, Bulk `0x02` e Interrupt `0x03`), `UsbdQueueAsyncTransfer`, `UsbdGetDeviceDescriptor`, `UsbdGetEndpointDescriptor`, `UsbdAddDeviceComplete` e `UsbdRegisterDriverObject`. O projeto [`hiddriver360`](research/repos/hiddriver360/hiddriver/main.cpp) comprova em código C++ funcional no retail `17559` que plugins `.xex` conseguem enumerar dispositivos USB, abrir endpoints e executar transferências assíncronas Control e Interrupt.
-2. **Ambiente ABadAvatar + XeUnshackle suporta plugins `.xex` em runtime:** Diferente de um RGH permanente, o **ABadAvatar** executa em RAM via exploit de hypervisor (compatível inclusive com placas **Winchester** do Xbox 360 E). Quando pareado ao **XeUnshackle**, ele aplica os patches de kernel/HV em memória e carrega o **DashLaunch (`launch.xex`)**, permitindo carregar plugins `.xex` de sistema via `launch.ini` que permanecem residentes na Aurora e durante jogos.
-3. **Gap técnico mapeado (não impeditivo):** O `hiddriver360` intercepta `HidAddDevice`, que só é chamado para classe USB HID (`bInterfaceClass == 0x03`). Um dongle Bluetooth HCI padrão usa classe Wireless Controller (`0xE0 / 0x01 / 0x01`) ou Vendor-Specific (`0xFF`). Portanto, o protótipo precisará ou utilizar `UsbdRegisterDriverObject` (@755) — cuja estrutura exata de entrada precisa ser verificada no kernel `17559` — ou hookear o ponto de despacho de dispositivos não reconhecidos / tabela de drivers do `Usbd`.
+Deixe de fora, ao mesmo tempo, o hiddriver360 e o X360Remap. Os dois também injetam controle e disputam a mesma leitura.
 
----
+## Arquivos prontos
 
-## Estado do Projeto
+Baixe a pasta [`xbox/`](xbox/) deste repositório. São quatro arquivos:
 
-| Fase | Descrição | Status |
-| :--- | :--- | :--- |
-| Fase 1 | Pesquisa da pilha USB do Xbox 360 e ambiente ABadAvatar | Concluída |
-| Fase 2 | Análise de projetos existentes (`UsbdSecPatch`, `hiddriver360`, `WirelessInput360`, `FreeMyXe`, `XeUnshackle`) | Concluída |
-| Fase 3 | Estudo do transporte Bluetooth USB HCI (`btusb`, BlueZ, especificações) | Concluída |
-| Fase 4 | Comparação e recomendação de arquitetura | Concluída |
-| Fase 5 | Planejamento do primeiro protótipo mínimo (HCI Reset + Read Local Version) | Concluída |
-| Fase 6 | Estruturação documental e preparação para primeiro experimento | Concluída |
-| Fase 7 | Plugin residente, firmware RTL8761BU, dois DualShock 4 e injeção no XamInput | No console; jogador 1 e telas nativas em confirmação |
-| Fase 8 | Telas nativas do sistema (perfil e guia) pelo DualShock, sem tirar o controle original | No HD (`7784beb`); falta o boot que carrega esse xex |
+| Arquivo | Tamanho | Para onde vai no Xbox |
+| :--- | ---: | :--- |
+| `bt360_proto.xex` | 135168 | `Usb:\Apps\BTManager\` |
+| `BTManager.xex` | 1310720 | `Usb:\Apps\BTManager\` |
+| `rtl8761bu_fw.bin` | 44484 | raiz de `Usb:\` |
+| `rtl8761bu_config.bin` | 6 | raiz de `Usb:\` |
 
----
+Os dois `.bin` são o firmware público do RTL8761BU (`rtl_bt/rtl8761bu_fw.bin` e `rtl8761bu_config.bin` do linux-firmware), sem alteração. O plugin lê esses nomes em `\Device\Mass0\`, que neste uso é a raiz do mesmo disco USB.
 
-## Estrutura do Repositório
+O `bt360_proto.xex` sobe com o console e fica residente. O `BTManager.xex` é o aplicativo "Bluetooth" que a Aurora abre quando você quer parear, desconectar ou esquecer.
 
-- [`docs/feasibility.md`](docs/feasibility.md) — Análise de viabilidade técnica, matriz de evidências e riscos.
-- [`docs/xbox360-usb.md`](docs/xbox360-usb.md) — Arquitetura da pilha USB (`Usbd`) do Xbox 360, DashLaunch e ABadAvatar/XeUnshackle.
-- [`docs/bluetooth-hci.md`](docs/bluetooth-hci.md) — Transporte Bluetooth USB HCI (endpoints, comandos, eventos, ACL e inicialização).
-- [`docs/compatibility.md`](docs/compatibility.md) — Análise de chipsets (Realtek, Broadcom, Intel, Barrot, Actions, CSR) e firmware.
-- [`docs/architecture.md`](docs/architecture.md) — Comparação das alternativas arquiteturais (A, B, C, D) e recomendação.
-- [`docs/roadmap.md`](docs/roadmap.md) — Plano incremental e desenho do primeiro experimento.
-- [`research/`](research/README.md) — Referências técnicas e repositórios analisados.
-- [`src/`](src/README.md) — Pilha HCI/USB, sessão de pareamento, HID, injeção no XamInput, plugin e BTManager.
-- [`STATUS.md`](STATUS.md) — Handoff do que já foi visto no console e do que ainda falta confirmar.
+## Instalação
+
+1. No computador, copie os dois `.bin` para a raiz do disco USB.
+2. Copie os dois `.xex` para `Usb:\Apps\BTManager\`. Crie a pasta se ela não existir.
+3. No `launch.ini` que o DashLaunch já lê, na seção `[Plugins]`, use um slot livre:
+
+```ini
+[Plugins]
+plugin1 = Usb:\Apps\BTManager\bt360_proto.xex
+```
+
+Se `plugin1` já aponta para outro plugin seu, use `plugin2`, `plugin3`, `plugin4` ou `plugin5`. Mantenha os plugins que você já usa.
+
+4. Conecte o adaptador UGREEN em qualquer porta USB e deixe-o ligado.
+5. Ligue o Xbox pelo ABadAvatar, como de costume, e espere a Aurora abrir.
+6. Fique na Aurora por cerca de 15 segundos. O disco USB pisca uma vez: o plugin rearma o barramento USB para o kernel entregar o adaptador que já estava conectado. Espere o aviso "Adaptador Bluetooth pronto".
+7. Na Aurora, abra o aplicativo Bluetooth.
+
+O plugin só entra na memória num boot completo. Trocar o `bt360_proto.xex` pede desligar e ligar de novo. O `BTManager.xex` atualiza ao sair com B e abrir o aplicativo outra vez.
+
+## Parear o DualShock 4
+
+1. No aplicativo, abra a aba Buscar.
+2. No DualShock 4, segure SHARE + PS até a barra de luz piscar rápido.
+3. Aperte Y. A busca dura cerca de um minuto.
+4. Selecione o DualShock 4 e aperte A.
+
+O aviso "DualShock 4 pareado no Jogador N" confirma. O endereço fica em `Usb:\bt_devices.ini`, criado pelo plugin. Nos boots seguintes aperte PS no controle gravado: ele conecta sem abrir o aplicativo.
+
+Com dois DualShock já ligados, a tela avisa "Limite de 2 controles BT ativos. Desconecte um primeiro." Desconecte um em Controles (X) para conectar outro que já esteja guardado. Um quinto controle novo é recusado.
+
+## Limitações
+
+- Esta versão atende o DualShock 4 nesse adaptador UGREEN. Teclado, mouse, fone, DualSense e outros adaptadores ficam de fora.
+- Dois DualShock ficam ligados ao mesmo tempo. A biblioteca guarda quatro.
+- Com o controle original ligado, ele permanece no jogador 1. Um jogo que lê o jogador 1 também recebe os botões dos DualShock somados aos dele. Os jogadores seguintes continuam separados.
+- A tela nativa de perfil ("Entrar") e o guia do sistema pedem tecla, e esse caminho está nesta versão ainda sem um boot de confirmação. Se o DualShock não mover essa lista, use o controle original para sair dela.
+- O rearme do USB acontece uma vez, cerca de 15 segundos depois que a Aurora está na tela. Nesse instante os dispositivos USB caem e voltam. Deixe o adaptador e o disco no lugar.
+- Sem os dois `.bin` na raiz, o adaptador responde ao reset e não encontra controles.
+
+## Código e notas de desenvolvimento
+
+Quem for alterar o projeto parte de [`src/`](src/README.md). O handoff do que o console já mostrou está em [`STATUS.md`](STATUS.md). A pesquisa de USB, HCI e arquitetura está em [`docs/`](docs/feasibility.md).
