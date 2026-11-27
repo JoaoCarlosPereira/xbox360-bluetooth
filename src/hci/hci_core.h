@@ -57,6 +57,16 @@ extern "C" {
 #define HCI_MAX_CMD_SIZE                258u
 #define HCI_MAX_EVT_SIZE                257u
 
+/*
+ * BT 2.1+ Classic + SSP + Extended Inquiry Result event mask without reserved
+ * bits or LE Meta Event (safe across RTL8761, CSR8510 clones, Barrot, Actions).
+ */
+#define HCI_EVENT_MASK_CLASSIC_SSP_INIT \
+    { 0xFFu, 0xFFu, 0xFBu, 0xFFu, 0x07u, 0xF8u, 0xB7u, 0x00u }
+/* Minimal BT 1.2/2.0 Classic fallback if a controller rejects higher mask bytes. */
+#define HCI_EVENT_MASK_LEGACY_INIT \
+    { 0xFFu, 0xFFu, 0xFBu, 0xFFu, 0x07u, 0x00u, 0x00u, 0x00u }
+
 typedef struct {
     uint8_t  status;
     uint8_t  hci_version;
