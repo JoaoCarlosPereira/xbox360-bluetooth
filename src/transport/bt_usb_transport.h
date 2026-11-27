@@ -56,6 +56,7 @@ typedef struct {
                               uint16_t wValue, uint16_t wIndex,
                               const uint8_t *data, uint16_t length);
     int (*submit_intr_in)(void *ctx, uint8_t *buf, uint16_t max_len);
+    void (*release_control)(void *ctx); /* Optional: clear stuck EP0 pending flag on timeout */
 } bt_usb_hal_ops_t;
 
 typedef enum {
@@ -72,6 +73,7 @@ typedef enum {
 /* Fila de comandos HCI: um comando em voo por vez (fluxo do controlador). */
 #define BT_USB_CMD_QUEUE_DEPTH    16u
 #define BT_USB_CMD_TIMEOUT_MS     3000u
+#define BT_USB_INIT_MAX_RETRIES   3u
 /* Fila de eventos HCI para a thread do plugin (produtor: DPC USB). */
 #define BT_USB_EVT_FIFO_DEPTH     16u
 
@@ -128,6 +130,9 @@ typedef struct {
     uint16_t                 inflight_opcode;
     uint32_t                 inflight_age_ms;
     uint32_t                 cmd_timeouts;
+    uint8_t                  init_retries;
+    uint8_t                  mask_fallback_tried;
+    uint8_t                  inq_mode_fallback_tried;
     bool                     intr_armed;
     /* Ultimo comando enviado e ultimo evento HCI. A thread do plugin so le. */
     uint32_t                 trace_opcode;
