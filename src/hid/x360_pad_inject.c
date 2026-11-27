@@ -27,11 +27,38 @@ void x360_pad_inject_init(x360_pad_inject_t *p, const x360_pad_sink_t *sink) {
     p->player = 0u;
     p->packet = 0u;
     p->last = (x360_gamepad_state_t){ 0 };
+    p->button_level = 0u;
+    p->button_release = 0u;
 }
 
-/* Mesma zona do controle oficial. A Aurora rola a capa com o analógico. */
+/* Mesma zona do controle oficial. A Aurora rola a capa com o analógico.
+ * Sair do centro exige um pouco mais, para o polegar no direcional não
+ * atravessar a zona a cada quadro. */
 #define X360_PAD_LEFT_DEADZONE  7849
 #define X360_PAD_RIGHT_DEADZONE 8689
+#define X360_PAD_STICK_GATE     4096
+#define X360_PAD_TRIGGER_FLOOR  30
+#define X360_PAD_DPAD_MASK      0x000Fu
+#define X360_PAD_DPAD_RELEASE   3u
+#define X360_PAD_AXIS_HOLD      1536
+#define X360_PAD_TRIGGER_HOLD   12
+
+bool x360_pad_in_use(const x360_gamepad_state_t *state) {
+    if (!state) return false;
+    if (state->buttons != 0u) return true;
+    if (state->left_trigger >= X360_PAD_TRIGGER_FLOOR ||
+        state->right_trigger >= X360_PAD_TRIGGER_FLOOR)
+        return true;
+    if (state->thumb_lx > X360_PAD_LEFT_DEADZONE || state->thumb_lx < -X360_PAD_LEFT_DEADZONE)
+        return true;
+    if (state->thumb_ly > X360_PAD_LEFT_DEADZONE || state->thumb_ly < -X360_PAD_LEFT_DEADZONE)
+        return true;
+    if (state->thumb_rx > X360_PAD_RIGHT_DEADZONE || state->thumb_rx < -X360_PAD_RIGHT_DEADZONE)
+        return true;
+    if (state->thumb_ry > X360_PAD_RIGHT_DEADZONE || state->thumb_ry < -X360_PAD_RIGHT_DEADZONE)
+        return true;
+    return false;
+}
 
 static uint32_t isqrt_u64(uint64_t n) {
     uint64_t r = 0;
@@ -49,14 +76,17 @@ static uint32_t isqrt_u64(uint64_t n) {
     return (uint32_t)r;
 }
 
-/* Centro vira zero. Fora da zona, o curso restante ocupa o eixo inteiro. */
-static void calm_stick(int16_t *x, int16_t *y, int32_t dead) {
+/* Centro vira zero. Fora da zona, o curso restante ocupa o eixo inteiro.
+ * Com o eixo já em zero, a entrada só acontece depois da zona mais a folga. */
+static void calm_stick(int16_t *x, int16_t *y, int16_t prev_x, int16_t prev_y, int32_t dead) {
     const int64_t lx = *x;
     const int64_t ly = *y;
     const uint64_t mag2 = (uint64_t)(lx * lx + ly * ly);
     const uint32_t mag = isqrt_u64(mag2);
+    int32_t gate = dead;
     int32_t neu;
-    if (mag <= (uint32_t)dead) {
+    if (prev_x == 0 && prev_y == 0) gate = dead + X360_PAD_STICK_GATE;
+    if (mag <= (uint32_t)gate) {
         *x = 0;
         *y = 0;
         return;
@@ -67,9 +97,63 @@ static void calm_stick(int16_t *x, int16_t *y, int32_t dead) {
     *y = (int16_t)(ly * neu / (int32_t)mag);
 }
 
-static void calm_pad(x360_gamepad_state_t *pad) {
-    calm_stick(&pad->thumb_lx, &pad->thumb_ly, X360_PAD_LEFT_DEADZONE);
-    calm_stick(&pad->thumb_rx, &pad->thumb_ry, X360_PAD_RIGHT_DEADZONE);
+static uint8_t calm_trigger(uint8_t v) {
+    return v < X360_PAD_TRIGGER_FLOOR ? 0u : v;
+}
+
+static int16_t hold_near(int16_t v, int16_t prev, int32_t tol) {
+    int32_t d = (int32_t)v - (int32_t)prev;
+    if (d < 0) d = -d;
+    return d <= tol ? prev : v;
+}
+
+static uint8_t hold_trigger(uint8_t v, uint8_t prev) {
+    int d = (int)v - (int)prev;
+    if (d < 0) d = -d;
+    return d <= X360_PAD_TRIGGER_HOLD ? prev : v;
+}
+
+/* O polegar parado muda o eixo a cada quadro. Segurar o valor anterior
+ * impede que o teclado trate isso como um Y novo. */
+static void settle_analogs(x360_gamepad_state_t *pad, const x360_gamepad_state_t *prev) {
+    pad->thumb_lx = hold_near(pad->thumb_lx, prev->thumb_lx, X360_PAD_AXIS_HOLD);
+    pad->thumb_ly = hold_near(pad->thumb_ly, prev->thumb_ly, X360_PAD_AXIS_HOLD);
+    pad->thumb_rx = hold_near(pad->thumb_rx, prev->thumb_rx, X360_PAD_AXIS_HOLD);
+    pad->thumb_ry = hold_near(pad->thumb_ry, prev->thumb_ry, X360_PAD_AXIS_HOLD);
+    pad->left_trigger = hold_trigger(pad->left_trigger, prev->left_trigger);
+    pad->right_trigger = hold_trigger(pad->right_trigger, prev->right_trigger);
+}
+
+static void calm_pad(x360_gamepad_state_t *pad, const x360_gamepad_state_t *prev) {
+    calm_stick(&pad->thumb_lx, &pad->thumb_ly, prev->thumb_lx, prev->thumb_ly, X360_PAD_LEFT_DEADZONE);
+    calm_stick(&pad->thumb_rx, &pad->thumb_ry, prev->thumb_rx, prev->thumb_ry, X360_PAD_RIGHT_DEADZONE);
+    pad->left_trigger = calm_trigger(pad->left_trigger);
+    pad->right_trigger = calm_trigger(pad->right_trigger);
+}
+
+/* Um quadro com o botão solto não conta. Três seguidos soltam.
+ * O guia entra e sai na hora. Troca de botão também entra na hora. */
+static uint16_t stable_buttons(x360_pad_inject_t *p, uint16_t buttons) {
+    const uint16_t guide = (uint16_t)(buttons & X360_BTN_GUIDE);
+    const uint16_t raw = (uint16_t)(buttons & (uint16_t)~X360_BTN_GUIDE);
+    const uint16_t prev = p->button_level;
+    const uint16_t rose = (uint16_t)(raw & (uint16_t)~prev);
+    const uint16_t fell = (uint16_t)(prev & (uint16_t)~raw);
+    if (fell == 0u) {
+        p->button_release = 0u;
+        p->button_level = raw;
+        return (uint16_t)(raw | guide);
+    }
+    if (rose != 0u) {
+        p->button_level = raw;
+        p->button_release = 0u;
+        return (uint16_t)(raw | guide);
+    }
+    if (++p->button_release < X360_PAD_DPAD_RELEASE)
+        return (uint16_t)(prev | guide);
+    p->button_level = raw;
+    p->button_release = 0u;
+    return (uint16_t)(raw | guide);
 }
 
 bool x360_pad_inject_publish(x360_pad_inject_t *p, bool authenticated, uint8_t player,
@@ -79,11 +163,18 @@ bool x360_pad_inject_publish(x360_pad_inject_t *p, bool authenticated, uint8_t p
         return false;
 
     /* Jogador mudou (ex.: oficial saiu): libera o slot antigo antes de ocupar o novo. */
-    if (p->active && p->player != player) clear_slot(p, p->player);
+    if (p->active && p->player != player) {
+        clear_slot(p, p->player);
+        p->last = (x360_gamepad_state_t){ 0 };
+        p->button_level = 0u;
+        p->button_release = 0u;
+    }
 
     x360_gamepad_state_t out = *state;
     if (ps_pressed) out.buttons = (uint16_t)(out.buttons | X360_BTN_GUIDE);
-    calm_pad(&out);
+    calm_pad(&out, &p->last);
+    out.buttons = stable_buttons(p, out.buttons);
+    settle_analogs(&out, &p->last);
     /* O pacote oficial só muda quando o estado muda. Publicar igual a cada
      * 10 ms fazia um toque na seta avançar uma capa por leitura. */
     if (p->active && p->player == player && memcmp(&out, &p->last, sizeof out) == 0)
@@ -107,6 +198,8 @@ void x360_pad_inject_drop(x360_pad_inject_t *p) {
     p->player = 0u;
     p->packet++;
     p->last = (x360_gamepad_state_t){ 0 };
+    p->button_level = 0u;
+    p->button_release = 0u;
     end_write(p);
 }
 
@@ -264,16 +357,46 @@ uint32_t x360_pad_keystroke_next(x360_key_tracker_t *tracker, const x360_gamepad
     if (bit >= 0) {
         tracker->pending_down = (uint16_t)(tracker->pending_down & (uint16_t)~(1u << bit));
         tracker->repeat_bit = (uint16_t)(1u << bit);
-        tracker->next_repeat = now_ms + 450u;
+        tracker->next_repeat = now_ms + 700u;
         return emit_key(out, bit, X360_KEY_DOWN, user_index);
     }
-    if (tracker->repeat_bit && (tracker->level & tracker->repeat_bit) &&
+    /* A, B, X e Y disparam uma vez. Repetir o Y enche o teclado de espaços
+     * e a tela deixa de responder. Só o direcional repete. */
+    if ((tracker->repeat_bit & X360_PAD_DPAD_MASK) && (tracker->level & tracker->repeat_bit) &&
         now_ms >= tracker->next_repeat) {
-        tracker->next_repeat = now_ms + 140u;
+        tracker->next_repeat = now_ms + 280u;
         bit = lowest_set(tracker->repeat_bit);
         return emit_key(out, bit, (uint16_t)(X360_KEY_DOWN | X360_KEY_REPEAT), user_index);
     }
     return X360_PAD_ERROR_EMPTY;
+}
+
+uint16_t x360_pad_face_bit(uint16_t virtual_key) {
+    if (virtual_key == 0x5800u) return X360_BTN_A;
+    if (virtual_key == 0x5801u) return X360_BTN_B;
+    if (virtual_key == 0x5802u) return X360_BTN_X;
+    if (virtual_key == 0x5803u) return X360_BTN_Y;
+    return 0u;
+}
+
+uint32_t x360_pad_keystroke_filter(x360_key_tracker_t *tracker, const x360_gamepad_state_t *ds4,
+                                   uint32_t original_status, x360_keystroke_t *key,
+                                   uint8_t user_index, uint32_t now_ms) {
+    x360_keystroke_t ignored;
+    const uint16_t held = ds4 ? guide_nav_bits(ds4) : 0u;
+    const uint16_t face = (original_status == 0u && key) ? x360_pad_face_bit(key->virtual_key) : 0u;
+    if (face != 0u && (held & face) != 0u) {
+        const uint32_t ours = x360_pad_keystroke_next(tracker, ds4, user_index, now_ms, key);
+        if (ours != X360_PAD_ERROR_SUCCESS && key) memset(key, 0, sizeof *key);
+        return ours;
+    }
+    if (original_status == 0u) {
+        if (ds4) (void)x360_pad_keystroke_next(tracker, ds4, user_index, now_ms, &ignored);
+        return original_status;
+    }
+    if (!ds4 || x360_pad_keystroke_next(tracker, ds4, user_index, now_ms, key) != 0u)
+        return original_status;
+    return X360_PAD_ERROR_SUCCESS;
 }
 
 x360_pad_bind_verdict_t x360_pad_inject_check_bind(uint8_t decided_player, uint8_t returned_user) {
