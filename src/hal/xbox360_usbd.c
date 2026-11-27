@@ -1,4 +1,5 @@
 #include "xbox360_usbd.h"
+#include "../chipset/bt_chipset.h"
 #include "../transport/bt_usb_transport.h"
 
 #ifdef __XSDK__
@@ -52,6 +53,8 @@ _Static_assert(offsetof(usb_driver_17559_t, match) == 0x14, "USB match callback 
 _Static_assert(offsetof(usb_driver_17559_t, optional_event) == 0x18, "USB event callback offset");
 _Static_assert(sizeof(usb_driver_17559_t) == 0x1C, "USB object layout");
 
+#define ACL_TX_Q_CAP 16u
+
 typedef struct {
     void *device;
     x360_usb_control_trb_t control;
@@ -71,8 +74,8 @@ typedef struct {
     uint32_t bulk_report;
     uint32_t in_handle;
     uint32_t out_handle;
-    uint8_t acl_q[4][516];
-    uint16_t acl_q_len[4];
+    uint8_t acl_q[ACL_TX_Q_CAP][516];
+    uint16_t acl_q_len[ACL_TX_Q_CAP];
     uint8_t acl_q_head;
     uint8_t acl_q_tail;
     uint8_t acl_q_count;
@@ -88,11 +91,12 @@ static x360_acl_rx_fn acl_rx;
 static uint32_t adapter_status;
 static uint32_t diagnostic_error;
 static uint32_t matches;
-static uint32_t wrong_matches;   /* wireless-class HCI interface with another VID/PID */
+static uint32_t matched_vid_pid; /* VID<<16 | PID of the last accepted Bluetooth adapter */
+static uint32_t wrong_matches;   /* unsupported Bluetooth HCI interface (e.g. Intel) */
 static uint32_t match_calls;     /* every call from the kernel selector, accepted or not */
 static uint32_t match_reason;
 static uint32_t match_seen;
-static uint32_t adapter_removed; /* 1 after the UGREEN left, cleared on the next add */
+static uint32_t adapter_removed; /* 1 after the adapter left, cleared on the next add */
 
 static void set_status(uint32_t status, uint32_t error) {
     __atomic_store_n(&diagnostic_error, error, __ATOMIC_RELAXED);
@@ -117,13 +121,15 @@ void x360_usbd_log_changes(void) {
     static uint32_t last_wrong;
     const uint32_t wrong = x360_usbd_wrong_adapter_hits();
     if (wrong != last_wrong) {
-        xsdk_plugin_log("usb: refused wireless-class adapter with another VID/PID hits=%u", wrong);
+        xsdk_plugin_log("usb: refused unsupported Bluetooth adapter hits=%u", wrong);
         last_wrong = wrong;
     }
     const uint32_t status = x360_usbd_adapter_status();
     const uint32_t n = __atomic_load_n(&matches, __ATOMIC_RELAXED);
     if (n != last_matches) {
-        xsdk_plugin_log("usb: matched Bluetooth 2B89:8761 HCI interface hits=%u", n);
+        const uint32_t vp = __atomic_load_n(&matched_vid_pid, __ATOMIC_RELAXED);
+        xsdk_plugin_log("usb: matched Bluetooth %04X:%04X HCI interface hits=%u",
+                        vp >> 16, vp & 0xFFFFu, n);
         last_matches = n;
     }
     static uint32_t last_calls;
@@ -215,7 +221,7 @@ static void pump_bulk_out(void) {
         if (__atomic_load_n(&adapter.bulk_out_pending, __ATOMIC_ACQUIRE)) return;
         const uint16_t n = adapter.acl_q_len[adapter.acl_q_head];
         memcpy(adapter.bulk_tx, adapter.acl_q[adapter.acl_q_head], n);
-        adapter.acl_q_head = (uint8_t)((adapter.acl_q_head + 1u) % 4u);
+        adapter.acl_q_head = (uint8_t)((adapter.acl_q_head + 1u) % ACL_TX_Q_CAP);
         adapter.acl_q_count--;
         adapter.bulk_out.endpoint = adapter.out_handle;
         adapter.bulk_out.buffer = adapter.bulk_tx;
@@ -256,6 +262,10 @@ void x360_usbd_service(void) {
         xsdk_plugin_log("usb: bulk endpoints absent");
     else if (report)
         xsdk_plugin_log("usb: bulk open failed status=%08X", report);
+    if (adapter.device && !adapter.removing && adapter.transport.state == BT_INIT_ERROR &&
+        x360_usbd_adapter_status() != BT_USB_STAGE_ERROR) {
+        set_status(BT_USB_STAGE_ERROR, (uint32_t)adapter.transport.last_error);
+    }
     acl_drain();
     pump_bulk_out();
 }
@@ -266,9 +276,9 @@ void x360_usbd_set_acl_rx(x360_acl_rx_fn fn) {
 
 int x360_usbd_acl_tx(const uint8_t *data, uint16_t len) {
     if (!data || !len || len > sizeof adapter.bulk_tx || adapter.removing ||
-        !adapter.out_handle || adapter.acl_q_count >= 4u) {
+        !adapter.out_handle || adapter.acl_q_count >= ACL_TX_Q_CAP) {
         static uint32_t logged;
-        const uint32_t why = !adapter.out_handle ? 1u : (adapter.acl_q_count >= 4u ? 2u : 3u);
+        const uint32_t why = !adapter.out_handle ? 1u : (adapter.acl_q_count >= ACL_TX_Q_CAP ? 2u : 3u);
         if (why != logged) {
             logged = why;
             xsdk_plugin_log("usb: acl tx refused why=%u out=%08X queued=%u len=%u",
@@ -278,7 +288,7 @@ int x360_usbd_acl_tx(const uint8_t *data, uint16_t len) {
     }
     memcpy(adapter.acl_q[adapter.acl_q_tail], data, len);
     adapter.acl_q_len[adapter.acl_q_tail] = len;
-    adapter.acl_q_tail = (uint8_t)((adapter.acl_q_tail + 1u) % 4u);
+    adapter.acl_q_tail = (uint8_t)((adapter.acl_q_tail + 1u) % ACL_TX_Q_CAP);
     adapter.acl_q_count++;
     pump_bulk_out();
     return 0;
@@ -408,11 +418,16 @@ static void remember_match(uint32_t reason, uint32_t seen) {
     __atomic_add_fetch(&match_calls, 1, __ATOMIC_RELEASE);
 }
 
-static uint32_t match_ugreen(const uint8_t *candidate, const x360_usb_device_descriptor_t *device,
-                             const usb_driver_17559_t *driver) {
+static void release_control_cb(void *ctx) {
+    adapter_t *a = ctx;
+    if (a) a->control_pending = false;
+}
+
+static uint32_t match_bt_adapter(const uint8_t *candidate, const x360_usb_device_descriptor_t *device,
+                                 const usb_driver_17559_t *driver) {
     (void)driver;
     /* reason: 1 null, 2 not an interface, 3 not interface 0, 4 not HCI,
-     * 5 bad device descriptor, 6 other VID/PID, 7 already attached, 0 accepted. */
+     * 5 bad device descriptor, 6 ignored/unsupported VID/PID, 7 already attached, 0 accepted. */
     uint32_t seen = 0;
     uint32_t reason = 1;
     if (candidate && candidate[0] >= sizeof(x360_usb_interface_descriptor_t)) {
@@ -428,13 +443,18 @@ static uint32_t match_ugreen(const uint8_t *candidate, const x360_usb_device_des
                     if (device && device->bLength >= sizeof *device && device->bDescriptorType == 1) {
                         const uint16_t vid = x360_bswap16(device->idVendor);
                         const uint16_t pid = x360_bswap16(device->idProduct);
+                        const bt_usb_match_result_t m = bt_chipset_match_usb(
+                            vid, pid, candidate[5], candidate[6], candidate[7]);
                         seen = ((uint32_t)vid << 16) | pid;
-                        if (vid != 0x2B89 || pid != 0x8761) {
+                        if (m == BT_USB_MATCH_UNSUPPORTED) {
                             __atomic_add_fetch(&wrong_matches, 1, __ATOMIC_RELAXED);
+                            reason = 6;
+                        } else if (m != BT_USB_MATCH_ACCEPT) {
                             reason = 6;
                         } else if (adapter.device) {
                             reason = 7;
                         } else {
+                            __atomic_store_n(&matched_vid_pid, seen, __ATOMIC_RELAXED);
                             __atomic_add_fetch(&matches, 1, __ATOMIC_RELAXED);
                             remember_match(0, seen);
                             return 1;
@@ -448,7 +468,7 @@ static uint32_t match_ugreen(const uint8_t *candidate, const x360_usb_device_des
     return 0;
 }
 
-static void add_ugreen(void *device) {
+static void add_bt_adapter(void *device) {
     const x360_usb_endpoint_descriptor_t *ep = p_UsbdGetEndpointDescriptor(
         device, 0, BT_USB_EP_TYPE_INTERRUPT, BT_USB_DIR_IN);
     if (adapter.device || !ep || ep->bLength < sizeof *ep || ep->bDescriptorType != 5 ||
@@ -464,12 +484,21 @@ static void add_ugreen(void *device) {
         return;
     }
 
+    uint16_t vid = 0;
+    uint16_t pid = 0;
+    const x360_usb_device_descriptor_t *dd = p_UsbdGetDeviceDescriptor(device);
+    if (dd && dd->bLength >= sizeof *dd && dd->bDescriptorType == 1) {
+        vid = x360_bswap16(dd->idVendor);
+        pid = x360_bswap16(dd->idProduct);
+    }
+    const uint8_t interval = ep->bInterval ? ep->bInterval : 1u;
+
     memset(&adapter, 0, sizeof adapter);
     adapter.device = device;
     __atomic_store_n(&adapter_removed, 0, __ATOMIC_RELEASE);
     bt_usb_device_info_t info = {
-        .vid = 0x2B89, .pid = 0x8761, .interface_num = 0, .has_intr_in = true,
-        .intr_in = { ep->bEndpointAddress, ep->bmAttributes, packet_size, ep->bInterval }
+        .vid = vid, .pid = pid, .interface_num = 0, .has_intr_in = true,
+        .intr_in = { ep->bEndpointAddress, ep->bmAttributes, packet_size, interval }
     };
     const x360_usb_endpoint_descriptor_t *bin = p_UsbdGetEndpointDescriptor(
         device, 0, BT_USB_EP_TYPE_BULK, BT_USB_DIR_IN);
@@ -489,7 +518,7 @@ static void add_ugreen(void *device) {
             info.bulk_out = (bt_usb_ep_info_t){ bout->bEndpointAddress, bout->bmAttributes, mps, 0 };
         }
     }
-    const bt_usb_hal_ops_t hal = { &adapter, submit_control, submit_interrupt };
+    const bt_usb_hal_ops_t hal = { &adapter, submit_control, submit_interrupt, release_control_cb };
     if (bt_usb_transport_init(&adapter.transport, &info, &hal) != 0) {
         adapter.device = NULL;
         set_status(BT_USB_STAGE_ERROR, 0xE0010004u);
@@ -537,7 +566,7 @@ static int32_t close_next(void *trb, int32_t status) {
     return 0;
 }
 
-static void remove_ugreen(void *device) {
+static void remove_bt_adapter(void *device) {
     if (device != adapter.device) {
         p_UsbdRemoveDeviceComplete(device);
         return;
@@ -551,7 +580,7 @@ static void remove_ugreen(void *device) {
 }
 
 static usb_driver_17559_t driver = {
-    .add = add_ugreen, .remove = remove_ugreen, .match = match_ugreen
+    .add = add_bt_adapter, .remove = remove_bt_adapter, .match = match_bt_adapter
 };
 
 typedef int (*usbd_void_fn)(void);
@@ -658,7 +687,7 @@ int x360_usbd_resolve_ordinals(void) {
     set_status(BT_USB_STAGE_WAITING, 0);
     usb_krnl = krnl;
     register_driver_fn = (void (*)(usb_driver_17559_t *))register_driver;
-    /* The driver is registered inside x360_usbd_enumerate_ugreen, after Aurora
+    /* The driver is registered inside x360_usbd_enumerate_adapter, after Aurora
      * is the running title. Registering here never re-offers the dongle. */
     xsdk_plugin_log("usb: ordinals ready; bus reset waits until Aurora is the running title");
     return 0;
@@ -668,7 +697,7 @@ void x360_usbd_release_control(void) {
     adapter.control_pending = false;
 }
 
-int x360_usbd_enumerate_ugreen(void) {
+int x360_usbd_enumerate_adapter(void) {
     if (!register_driver_fn || !usb_krnl) return -1;
     return usbd_enumerate_silent();
 }
