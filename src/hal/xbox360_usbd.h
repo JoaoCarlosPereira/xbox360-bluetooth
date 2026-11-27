@@ -19,12 +19,12 @@ int x360_usbd_resolve_ordinals(void);
 /* After Aurora is the running title: stop the host controllers, register, and
  * re-enter USBD. No disk access in that window. Returns 0, 1 when the leftover
  * page was not freed, or a negative code when the 17559 prologue does not match. */
-int x360_usbd_enumerate_ugreen(void);
+int x360_usbd_enumerate_adapter(void);
 uint32_t x360_usbd_adapter_status(void);
 void x360_usbd_log_changes(void);
-/* Wireless-class HCI interface seen with a VID/PID other than the UGREEN (refused). */
+/* Unsupported wireless-class HCI interface refused (e.g. Intel bootloader). */
 uint32_t x360_usbd_wrong_adapter_hits(void);
-/* True after the UGREEN was removed, until it is added again. */
+/* True after the active Bluetooth adapter was removed, until one is added again. */
 bool x360_usbd_adapter_removed(void);
 /* Solta o controle se um comando longo nao completou. O callback tardio so zera de novo. */
 void x360_usbd_release_control(void);
