@@ -34,6 +34,8 @@ extern "C" {
 #define BT_PAIR_LISTEN_MS          20000u
 /* Intervalo minimo entre avisos de "ja existe um DualShock 4" (PAR-03). */
 #define BT_PAIR_SECOND_DS4_MS      10000u
+/* Sem botão nem analógico, o link cai. O PS liga de novo. */
+#define BT_PAIR_IDLE_MS            (15ull * 60ull * 1000ull)
 
 typedef struct {
     void *ctx;
@@ -79,6 +81,8 @@ typedef struct {
     bool            incoming;
     bool            retry_armed;
     uint64_t        retry_at_ms;
+    uint64_t        used_ms;         /* último uso real; 0 ainda não estabelecido */
+    bool            idle_drop;       /* queda pedida por inatividade; não repagina */
 } bt_pair_second_t;
 
 typedef struct {
@@ -117,6 +121,10 @@ typedef struct {
     uint16_t        orphan_handle;   /* handle de uma página que falhou e o rádio ainda segura */
     bool            user_held;       /* o jogador pediu desconectar; nao repagina sozinho */
     bool            scan_hold;       /* solta o ACL ligado e só então abre a busca */
+    uint64_t        used_ms;         /* último uso real do primeiro DS4 */
+    bool            idle_drop;       /* queda pedida por inatividade; não repagina */
+    uint8_t         idle_addr[2][6]; /* endereços que o rádio não chama sozinho */
+    bool            idle_on[2];
     uint64_t        retry_at_ms;
     uint64_t        last_second_ms;
     bool            second_notified;
@@ -139,6 +147,8 @@ void bt_pair_session_on_event(bt_pair_session_t *s, const uint8_t *evt, size_t l
                               uint64_t now_ms);
 /* Relogio: timeout de 60 s (via bt_phase1_decide) e novas tentativas. */
 void bt_pair_session_tick(bt_pair_session_t *s, uint64_t now_ms);
+/* Botão, gatilho ou analógico fora do centro. slot 0 é o primeiro DS4, 1 o segundo. */
+void bt_pair_session_note_use(bt_pair_session_t *s, int slot, uint64_t now_ms);
 
 /* Endereco do DS4 gravado em ipc (ordem HCI) ou NULL. */
 const uint8_t *bt_pair_session_stored_addr(const bt_pair_session_t *s);
