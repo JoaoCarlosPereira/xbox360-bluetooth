@@ -2,6 +2,39 @@
 
 > Documento de handoff para continuidade em **PC x86 (Linux/WSL)** e posterior validação no **Xbox 360 E (ABadAvatar + XeUnshackle + Aurora)**.
 
+## Atualização de 26/11/2026
+
+O repositório em `main` está em `7784beb` (tarefas `#000058` a `#000070`), publicado em
+https://github.com/JoaoCarlosPereira/xbox360-bluetooth. O `bt360_proto.xex` desse
+commit tem 131072 bytes e 26931 instruções, sem ponto flutuante nem VMX, e já
+foi copiado para `Usb:\Apps\BTManager`. Ele só entra na memória no próximo boot.
+
+O que o console já mostrou antes desse xex:
+
+- O UGREEN sobe com o plugin e o adaptador chega em "pronto".
+- Os dois DualShock gravados (`20:29:92:82:2F:67` e `20:29:92:81:82:73`)
+  reconectam. Depois de timeout de página ou de conexão o rádio escuta por
+  20 s, aceita o endereço gravado e, no segundo link que entra, pede cifra.
+- Cada DualShock recebe o jogador do usuário que o XAM entrega. Com o controle
+  original no usuário 0, ele continua no jogador 1 e os DualShock vão para os
+  jogadores seguintes.
+- A leitura do jogador 1 guarda os botões do original e soma os dos DualShock.
+  A troca que substituía o original foi removida.
+- Aurora, jogos e o BTManager enxergam o estado do controle. A tela nativa de
+  perfil ("Entrar") não: ela pede tecla, não o estado. Com o DualShock marcado
+  como jogador 1 ela continuava muda, e o original também não saía da tela
+  quando a leitura dele tinha sido desviada.
+
+O xex que está no HD, ainda sem boot confirmado, copia o corpo inteiro de
+`XamInputGetKeystroke` (ordinal 403, cerca de dez instruções) para não derrubar
+o teclado, e devolve A e direcional do DualShock quando o original não tem
+tecla. O `GetKeystrokeHud` (409) só é desviado se o prólogo for seguro.
+
+Ainda aberto: confirmar nesse boot a tela de perfil com os dois controles,
+o canal HID do segundo DualShock (a remontagem ACL deixou de misturar os
+handles) e o critério de pronto da entrega. Não há quatro controles ao mesmo
+tempo: o rádio mantém dois links.
+
 ## Atualização de 24/11/2026
 
 - `make test` usa respostas HCI simuladas e não depende de `hci0`; os perfis
@@ -94,19 +127,11 @@
 - [x] **Testar a tela principal no Xenia Canary (PC x86):** validar layout 720p, fontes, cores e navegação D-pad com o build de emulação.
 - [ ] **Testar a tela de remapeamento com controle conectado.**
 
-### Fase B — Integração do Plugin Residente (`bt360_plugin.xex`)
-- [ ] **Conectar `bt360_plugin.xex` com toda a pilha `src/`:**
-  - Adicionar `submit_bulk_in` / `submit_bulk_out` em `xbox360_usbd.c` (`UsbdOpenEndpoint` com `BT_USB_EP_TYPE_BULK = 2`).
-  - Conectar `rtl8761b.c` lendo `rtl8761bu_fw.bin` e `rtl8761bu_config.bin` de `Usb:\bt_fw\` via `NtCreateFile`/`NtReadFile` (no Xbox 360 o dongle começa em cold-boot ROM!).
-  - Conectar `l2cap.c` + `ds4_bt.c` + `bt_manager.c` em uma thread de sistema (`ExCreateThread` com `EX_CREATE_FLAG_SYSTEM`), mantendo callbacks DPC livres de FPU/VMX.
-- [ ] **Completar o IPC entre o plugin e o gerenciador:**
-  - Testar o canal de diagnóstico no console, depois publicar o estado do
-    dongle e ligar os comandos do gerenciador à pilha USB e Bluetooth.
-- [ ] **Persistência de `Link Key` + Reconexão automática:**
-  - Salvar `Link_Key_Notification` (`0x18`) em `Usb:\bt_devices.ini` e responder `Link_Key_Request` (`0x17`) com `Link_Key_Request_Reply` (`0x0B` / `0x040B`), além de habilitar `Write_Scan_Enable` (`0x0C1A = 0x03`) para o DS4 reconectar apenas apertando o botão **PS**.
-  - Persistir também o `bt_button_map_t` customizado de cada controle no `bt_devices.ini`.
-- [ ] **Injeção de controles no `XamInput`:**
-  - Portar os hooks de `XamInputGetCapabilitiesEx`, `XamInputSetState` (rumble -> saída DS4 `0x11`!), `XInputdReadState` e `XamUserBindDeviceCallback` (usando `research/repos/hiddriver360/hiddriver/main.cpp` como referência exata para retail `17559`).
+### Fase B — Integração do Plugin Residente (`bt360_proto.xex`)
+- [x] **Pilha no plugin:** bulk IN/OUT, firmware RTL8761BU, L2CAP HID, dois ACL e a thread do plugin sem FPU/VMX.
+- [x] **IPC com o BTManager** por `bt360_request.bin` / `bt360_reply.bin` em `Usb:\`.
+- [x] **Link key e reconexão:** `Usb:\bt_devices.ini`, resposta `0x040B`, escuta de 20 s depois de página perdida e aceite do endereço gravado que entra sozinho.
+- [x] **Injeção no XamInput:** `XInputdReadState` (486), `XamInputGetCapabilitiesEx` (685), `XamInputSetState` (402) e `XamUserBindDeviceCallback`. O ordinal 401 não é desviado. `GetKeystroke` (403) é copiado por inteiro; o Hud (409) só entra se o prólogo for seguro.
 
 ### Fase C — Validação no Xbox 360 E Real (ABadAvatar + XeUnshackle + Aurora)
 
@@ -125,9 +150,9 @@ Para analisar falhas, guarde os dois logs gerados pelos XEX mais recentes:
   em um dos locais alternativos do xsdk. Registra a inicialização gráfica,
   comandos enviados, respostas e tempos limite na comunicação com o plugin.
 
-Anote também a mensagem exibida no rodapé e se o dongle já estava conectado
-ao ligar o Xbox. A versão atual ainda não executa o vínculo USB nem o
-pareamento, portanto esses eventos ainda não aparecerão no log.
+O vínculo USB, o pareamento e a injeção já acontecem. O que o log precisa
+mostrar no próximo boot é `body hooked` no ordinal 403 e a tela de perfil
+respondendo ao DualShock e ao controle original.
 - [x] **Teste 1 (Smoke):** No Xbox 360 E (kernel 17559), o app e a capa
   apareceram na Aurora, a UI abriu em 720p escalado para 1080p e o plugin
   resolveu todos os ordinais consultados, inclusive o 755. O gerenciador
@@ -135,10 +160,9 @@ pareamento, portanto esses eventos ainda não aparecerão no log.
   de escrita com recuperação e um tempo limite de resposta no fim do log.
   O UGREEN na USB frontal permaneceu offline, como esperado enquanto o
   vínculo USB estiver ausente.
-- [ ] **Teste 2 (Descoberta USB `0xE0/0x01/0x01` no kernel `17559`):**
-  - Validar `UsbdRegisterDriverObject` (@755) ou identificar o ponto de despacho de dispositivos não-HID no `Usbd` do `xboxkrnl.exe` `17559`.
-- [ ] **Teste 3 (Bulk + Firmware + DS4 no console):**
-  - Confirmar `UsbdOpenEndpoint(..., BULK)` + upload de `rtl8761bu_fw.bin` + pareamento DS4 + navegação na Aurora/jogos.
+- [x] **Teste 2 (Descoberta USB `0xE0/0x01/0x01`):** o UGREEN é aberto pelo plugin e o adaptador chega em pronto com o dongle já ligado no boot.
+- [x] **Teste 3 (Bulk + firmware + dois DS4):** os dois controles sobem, recebem jogador e navegam a Aurora e o BTManager. O canal HID do segundo ainda precisa de um boot em que os dois loguem `hid: channels open`.
+- [ ] **Teste 4 (tela nativa de perfil):** no xex `7784beb`, A e direcional do DualShock devem mover a lista "Entrar" quando o original não tem tecla, e o original deve continuar saindo dessa tela. Ainda não houve boot com esse xex.
 
 ---
 
