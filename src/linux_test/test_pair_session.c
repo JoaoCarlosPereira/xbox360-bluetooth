@@ -259,9 +259,9 @@ static void test_reconnect_wait_not_blocking_on_mailbox(void) {
     feed(&r, e, evt_conn_complete(e, 0x04, 0, ADDR_A), 10 * S); /* page timeout */
     assert(r.s.state == BT_PAIR_IDLE);
     assert(count_op(&r.m, HCI_OP_CREATE_CONNECTION) == 1);
-    bt_pair_session_tick(&r.s, 10 * S + BT_PAIR_RECONNECT_RETRY_MS - 1);
-    assert(count_op(&r.m, HCI_OP_CREATE_CONNECTION) == 1);
     bt_pair_session_tick(&r.s, 10 * S + BT_PAIR_RECONNECT_RETRY_MS);
+    assert(count_op(&r.m, HCI_OP_CREATE_CONNECTION) == 1);
+    bt_pair_session_tick(&r.s, 10 * S + BT_PAIR_LISTEN_MS);
     assert(count_op(&r.m, HCI_OP_CREATE_CONNECTION) == 2);
     assert(r.m.inq_start == 0);
     printf("[PASS] PAR-05 nova tentativa de reconexao sem inquiry\n");
@@ -662,14 +662,18 @@ static void test_page_timeout_releases_handle(void) {
     assert(count_op(&r.m, HCI_OP_DISCONNECT) == 0);
     assert(r.s.orphan_handle == 0x0002u);
     assert(r.s.state == BT_PAIR_IDLE);
-    bt_pair_session_tick(&r.s, 1000 + BT_PAIR_RECONNECT_RETRY_MS);
+    bt_pair_session_tick(&r.s, 1000 + BT_PAIR_LISTEN_MS);
     assert(r.s.state == BT_PAIR_CONNECTING);
     uint8_t st[6] = { HCI_EVT_COMMAND_STATUS, 4, 0x0B, 1, 0, 0 };
     hci_put_le16(st + 4, HCI_OP_CREATE_CONNECTION);
-    bt_pair_session_on_event(&r.s, st, sizeof st, 1000 + BT_PAIR_RECONNECT_RETRY_MS);
+    bt_pair_session_on_event(&r.s, st, sizeof st, 1000 + BT_PAIR_LISTEN_MS);
     const cmd_rec_t *d = last_op(&r.m, HCI_OP_DISCONNECT);
     assert(d && d->len >= 2 && d->params[0] == 0x02 && d->params[1] == 0x00);
     assert(r.s.state == BT_PAIR_IDLE);
+    const int discs = count_op(&r.m, HCI_OP_DISCONNECT);
+    feed(&r, e, evt_conn_complete(e, 0x08, 0x0003u, ADDR_A), 50000);
+    assert(count_op(&r.m, HCI_OP_DISCONNECT) == discs);
+    assert(r.s.orphan_handle == 0x0003u);
     printf("[PASS] timeout de pagina guarda o handle; a recusa 0x0B solta\n");
 }
 
@@ -715,7 +719,7 @@ static void test_page_timeout_tries_the_other_stored(void) {
     const cmd_rec_t *first = last_op(&r.m, HCI_OP_CREATE_CONNECTION);
     assert(first && memcmp(first->params, ADDR_A, 6) == 0);
     feed(&r, e, evt_conn_complete(e, 0x04, 0, ADDR_A), 10 * S);
-    bt_pair_session_tick(&r.s, 10 * S + BT_PAIR_RECONNECT_RETRY_MS);
+    bt_pair_session_tick(&r.s, 10 * S + BT_PAIR_LISTEN_MS);
     const cmd_rec_t *next = last_op(&r.m, HCI_OP_CREATE_CONNECTION);
     assert(next && memcmp(next->params, ADDR_B, 6) == 0);
     printf("[PASS] timeout de pagina chama o outro controle gravado\n");
@@ -740,6 +744,29 @@ static void test_page_timeout_does_not_drop_the_incoming(void) {
     printf("[PASS] timeout de pagina nao derruba o controle que entra\n");
 }
 
+static void test_stored_controller_calling_in_is_not_already_paired(void) {
+    rig_t r;
+    static const uint8_t key_b[16] = { 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9 };
+    uint8_t e[32];
+    rig_init(&r, true);
+    assert(bt_manager_store_single_ds4(&r.ipc, ADDR_B, key_b, 5u, 2u, "DS4B") >= 0);
+    bt_pair_session_adapter_ready(&r.s, 0);
+    feed(&r, e, evt_conn_complete(e, 0x04, 0, ADDR_A), 1000);
+    bt_pair_session_tick(&r.s, 1000 + BT_PAIR_LISTEN_MS);
+    feed(&r, e, evt_conn_complete(e, 0x04, 0, ADDR_B), 2000 + BT_PAIR_LISTEN_MS);
+    feed(&r, e, evt_conn_request(e, ADDR_B, 0x002508u), 3000 + BT_PAIR_LISTEN_MS);
+    const cmd_rec_t *acc = last_op(&r.m, HCI_OP_ACCEPT_CONN_REQ);
+    assert(acc && memcmp(acc->params, ADDR_B, 6) == 0);
+    assert(count_op(&r.m, HCI_OP_REJECT_CONN_REQ) == 0);
+    assert(r.m.nnotified == 0);
+    feed(&r, e, evt_conn_complete(e, 0, 0x0002u, ADDR_B), 4000 + BT_PAIR_LISTEN_MS);
+    feed(&r, e, evt_auth_complete(e, 0, 0x0002u), 4001 + BT_PAIR_LISTEN_MS);
+    const cmd_rec_t *enc = last_op(&r.m, HCI_OP_SET_CONN_ENCRYPT);
+    assert(enc && enc->params[2] == 0x01u);
+    assert(count_op(&r.m, HCI_OP_DISCONNECT) == 0);
+    printf("[PASS] controle gravado que liga sozinho entra sem aviso de ja pareado\n");
+}
+
 static void test_retry_skips_the_controller_already_up(void) {
     rig_t r;
     static const uint8_t key_b[16] = { 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9 };
@@ -753,7 +780,7 @@ static void test_retry_skips_the_controller_already_up(void) {
     r.s.second.state = BT_PAIR_CONNECTED;
     memcpy(r.s.second.peer, ADDR_B, 6u);
     r.s.stored_turn = 1;
-    bt_pair_session_tick(&r.s, 1000 + BT_PAIR_RECONNECT_RETRY_MS);
+    bt_pair_session_tick(&r.s, 1000 + BT_PAIR_LISTEN_MS);
     const cmd_rec_t *page = last_op(&r.m, HCI_OP_CREATE_CONNECTION);
     assert(page && memcmp(page->params, ADDR_A, 6) == 0);
     printf("[PASS] a nova tentativa nao chama o controle que ja esta ligado\n");
@@ -779,6 +806,7 @@ int main(void) {
     test_two_stored_stay_connected();
     test_page_timeout_tries_the_other_stored();
     test_page_timeout_does_not_drop_the_incoming();
+    test_stored_controller_calling_in_is_not_already_paired();
     test_retry_skips_the_controller_already_up();
     test_err_03_disconnect_mid_session();
     test_adapter_lost_resets_session();
