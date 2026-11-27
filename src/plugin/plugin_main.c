@@ -535,6 +535,8 @@ static bool notify_system(const char *text) {
 #define KRNL_ORD_XINPUTD_READ_STATE      486u /* xboxkrnl.exe, main.cpp:1494 */
 #define XAM_ORD_INPUT_GET_CAPABILITIES_EX 685u /* xam.xex,      main.cpp:1496 */
 #define XAM_ORD_INPUT_SET_STATE           402u /* xam.xex,      main.cpp:1497 */
+#define XAM_ORD_INPUT_GET_KEYSTROKE       403u /* tela nativa; corpo curto, copiado inteiro */
+#define XAM_ORD_INPUT_GET_KEYSTROKE_HUD   409u /* painel do guia, só se o prólogo for seguro */
 #define XAM_ORD_SEND_XENON_BUTTON        1286u /* xkelib _xamext.h: abre o painel do Xbox */
 
 /* XInputdReadState(deviceContext, packetNumber, gamepad, unk), main.cpp:1365. */
@@ -545,10 +547,12 @@ typedef uint32_t (*xam_get_capabilities_ex_fn)(uint32_t unk, uint32_t user, uint
                                                x360_pad_caps_t *caps);
 /* XamInputSetState(user, flags, vibration): kernel.h; main.cpp:1307 declares it with extra arguments. */
 typedef uint32_t (*xam_set_state_fn)(uint32_t user, uint32_t flags, const INPUT_VIBRATION *vibration);
+typedef uint32_t (*xam_keystroke_fn)(uint32_t user, uint32_t flags, x360_keystroke_t *key);
 
 _Static_assert(sizeof(INPUT_GAMEPAD) == sizeof(x360_gamepad_state_t), "gamepad layout");
 
-enum { HOOK_READ_STATE, HOOK_CAPABILITIES, HOOK_SET_STATE, HOOK_COUNT };
+enum { HOOK_READ_STATE, HOOK_CAPABILITIES, HOOK_SET_STATE, HOOK_KEYSTROKE, HOOK_KEYSTROKE_HUD,
+       HOOK_COUNT };
 
 static x360_pad_inject_t g_pad;
 static x360_gamepad_state_t g_pad_report;   /* last HID report; empty until a transport delivers one */
@@ -597,7 +601,6 @@ static bool             g_pad2_bound;
 static uint8_t          g_pad2_bound_player;
 static uint8_t          g_pad2_user = 0xFFu;
 static bool             g_pad2_bind_refused;
-static bool             g_player_pinned; /* o gerenciador escolheu o jogador; o XAM nao reescreve */
 static bool             g_pad2_hid;
 static bool             g_pad2_logged_no_player;
 
@@ -605,29 +608,23 @@ static ppc_detour_t g_detours[HOOK_COUNT];
 static xinputd_read_state_fn      g_orig_read_state;
 static xam_get_capabilities_ex_fn g_orig_capabilities;
 static xam_set_state_fn           g_orig_set_state;
+static xam_keystroke_fn           g_orig_keystroke;
+static xam_keystroke_fn           g_orig_keystroke_hud;
+static x360_key_tracker_t         g_key_tracker;
 /* Trampolines are code the plugin writes: they live in .text, like hiddriver's ".text" Detour buffer. */
 __asm__(".pushsection .text.bt360_trampolines,\"ax\",@progbits\n"
         ".balign 128\n"
         ".globl bt360_trampolines\n"
         "bt360_trampolines:\n"
-        ".space 408\n"            /* HOOK_COUNT * PPC_DETOUR_TRAMPOLINE_WORDS * 4 */
+        ".space 680\n"            /* HOOK_COUNT * PPC_DETOUR_TRAMPOLINE_WORDS * 4 */
         ".popsection\n");
 extern uint32_t bt360_trampolines[];
 #define g_trampolines bt360_trampolines
-_Static_assert(HOOK_COUNT * PPC_DETOUR_TRAMPOLINE_WORDS * 4u == 408u, "trampoline buffer size");
+_Static_assert(HOOK_COUNT * PPC_DETOUR_TRAMPOLINE_WORDS * 4u == 680u, "trampoline buffer size");
 
-/* Troca na leitura, como o X360Remap: a tela de perfil e o teclado só leem o jogador 1.
- * O estado do DS4 ocupa essa leitura. O controle oficial volta no slot do DS4. */
-#define PAD_SWAP_MS 500u
+/* A tela de perfil só lê o jogador 1. O oficial fica nessa leitura e cada DS4 soma. */
 static uint32_t g_player1_context;
-static uint32_t g_swap_ms;
-static x360_gamepad_state_t g_displaced;
-static x360_gamepad_state_t g_displaced_last;
 static x360_gamepad_state_t g_swap_last;
-
-static bool swap_fresh(void) {
-    return g_swap_ms != 0u && (uint32_t)now_ms() - g_swap_ms < PAD_SWAP_MS;
-}
 
 static void bump_packet(uint32_t *packet, x360_gamepad_state_t *last, const x360_gamepad_state_t *now) {
     if (!packet || memcmp(last, now, sizeof *now) == 0) return;
@@ -639,10 +636,6 @@ static uint32_t hook_read_state(uint32_t context, uint32_t *packet, INPUT_GAMEPA
                                 uint32_t *unk) {
     const bool is0 = g_pad_device_context != 0u && context == g_pad_device_context;
     const bool is1 = g_pad2_context != 0u && context == g_pad2_context;
-    const bool both = g_pad_bound && g_pad2_bound;
-    x360_pad_inject_t *swap_pad = &g_pad;
-    uint8_t swap_user = g_pad_user;
-    uint32_t swap_context = g_pad_device_context;
     const uint32_t status = g_orig_read_state(context, packet, gamepad, unk);
     const uint32_t result = is1
         ? x360_pad_inject_filter_read_state(&g_pad2, true, status, packet,
@@ -650,64 +643,31 @@ static uint32_t hook_read_state(uint32_t context, uint32_t *packet, INPUT_GAMEPA
         : x360_pad_inject_filter_read_state(&g_pad, is0, status, packet,
                                             (x360_gamepad_state_t *)gamepad);
     if (result == X360_PAD_ERROR_SUCCESS && status != X360_PAD_ERROR_SUCCESS && unk) *unk = 0u;
-    /* O controle marcado como jogador 1 responde a leitura do usuário 0,
-     * mesmo quando o XAM o registrou em outro usuário e essa leitura falha. */
-    if (gamepad) {
-        x360_pad_inject_t *as_player1 = NULL;
-        uint32_t player1_context = 0;
-        if (g_pad_bound && g_pad_player == 1u && g_pad_device_context != 0u) {
-            as_player1 = &g_pad;
-            player1_context = g_pad_device_context;
-        } else if (g_pad2_bound && g_pad2_player == 1u && g_pad2_context != 0u) {
-            as_player1 = &g_pad2;
-            player1_context = g_pad2_context;
-        }
-        if (as_player1 && context != player1_context &&
-            context != g_pad_device_context && context != g_pad2_context) {
-            const x360_pad_snapshot_t snap = x360_pad_inject_snapshot(as_player1);
-            if (snap.active && context != 0u) {
-                if (g_player1_context == 0u || context < g_player1_context)
-                    g_player1_context = context;
-                if (context == g_player1_context) {
-                    x360_gamepad_state_t shown = snap.state;
-                    shown.buttons = (uint16_t)(shown.buttons & (uint16_t)~X360_BTN_GUIDE);
-                    *(x360_gamepad_state_t *)gamepad = shown;
-                    bump_packet(packet, &g_swap_last, &shown);
-                    if (unk) *unk = 0u;
-                    return X360_PAD_ERROR_SUCCESS;
-                }
-            }
-        }
-    }
-    if (!gamepad || result != X360_PAD_ERROR_SUCCESS || both) return result;
-    if (!g_pad_bound && g_pad2_bound) {
-        swap_pad = &g_pad2;
-        swap_user = g_pad2_user;
-        swap_context = g_pad2_context;
-    }
-    const bool is_ds4 = swap_context != 0u && context == swap_context;
-
-    const x360_pad_snapshot_t snap = x360_pad_inject_snapshot(swap_pad);
-    const bool other_player = swap_user != 0u && swap_user != 0xFFu;
-    if (!snap.active || !other_player) return result;
-
-    if (is_ds4) {
-        if (!swap_fresh()) return result;
-        *(x360_gamepad_state_t *)gamepad = g_displaced;
-        bump_packet(packet, &g_displaced_last, &g_displaced);
-        return result;
-    }
-
+    /* A tela de perfil só lê o jogador 1. O controle original permanece nessa
+     * leitura; cada DualShock ligado soma os botões dele, sem tomar o lugar. */
+    if (!gamepad || is0 || is1 || context == 0u) return result;
     if (g_player1_context == 0u || context < g_player1_context) g_player1_context = context;
     if (context != g_player1_context) return result;
-
-    g_displaced = *(x360_gamepad_state_t *)gamepad;
-    g_swap_ms = (uint32_t)now_ms();
-    x360_gamepad_state_t shown = snap.state;
-    shown.buttons = (uint16_t)(shown.buttons & (uint16_t)~X360_BTN_GUIDE);
-    *(x360_gamepad_state_t *)gamepad = shown;
-    bump_packet(packet, &g_swap_last, &shown);
-    return result;
+    {
+        const bool official = status == X360_PAD_ERROR_SUCCESS;
+        x360_gamepad_state_t shown = *(x360_gamepad_state_t *)gamepad;
+        bool keep = official;
+        const x360_pad_snapshot_t first = x360_pad_inject_snapshot(&g_pad);
+        const x360_pad_snapshot_t second = x360_pad_inject_snapshot(&g_pad2);
+        if (g_pad_bound && first.active) {
+            x360_pad_overlay_player1(&shown, &first.state, keep);
+            keep = true;
+        }
+        if (g_pad2_bound && second.active) {
+            x360_pad_overlay_player1(&shown, &second.state, keep);
+            keep = true;
+        }
+        if (!keep) return result;
+        *(x360_gamepad_state_t *)gamepad = shown;
+        bump_packet(packet, &g_swap_last, &shown);
+        if (!official && unk) *unk = 0u;
+        return X360_PAD_ERROR_SUCCESS;
+    }
 }
 
 static uint32_t hook_capabilities(uint32_t unk, uint32_t user, uint32_t flags, x360_pad_caps_t *caps) {
@@ -747,6 +707,43 @@ static void code_flush(const void *start, size_t bytes) {
     __asm__ volatile("isync" : : : "memory");
 }
 
+static uint32_t keystroke_from_ds4(uint32_t status, uint32_t user, x360_keystroke_t *key) {
+    x360_gamepad_state_t merged;
+    bool any = false;
+    x360_pad_snapshot_t snap;
+    if (status == 0u || !key) return status;
+    if (user != 0u && user != 0xFFu) return status;
+    memset(&merged, 0, sizeof merged);
+    if (g_pad_bound) {
+        snap = x360_pad_inject_snapshot(&g_pad);
+        if (snap.active) {
+            x360_pad_overlay_player1(&merged, &snap.state, false);
+            any = true;
+        }
+    }
+    if (g_pad2_bound) {
+        snap = x360_pad_inject_snapshot(&g_pad2);
+        if (snap.active) {
+            x360_pad_overlay_player1(&merged, &snap.state, any);
+            any = true;
+        }
+    }
+    if (!any) return status;
+    if (x360_pad_keystroke_next(&g_key_tracker, &merged, 0u, (uint32_t)now_ms(), key) != 0u)
+        return status;
+    return 0u;
+}
+
+static uint32_t hook_keystroke(uint32_t user, uint32_t flags, x360_keystroke_t *key) {
+    const uint32_t status = g_orig_keystroke(user, flags, key);
+    return keystroke_from_ds4(status, user, key);
+}
+
+static uint32_t hook_keystroke_hud(uint32_t user, uint32_t flags, x360_keystroke_t *key) {
+    const uint32_t status = g_orig_keystroke_hud(user, flags, key);
+    return keystroke_from_ds4(status, user, key);
+}
+
 static bool hook_install(const char *name, HANDLE module, uint32_t ordinal, unsigned index,
                          const void *hook, void **original) {
     void *target = NULL;
@@ -772,6 +769,34 @@ static bool hook_install(const char *name, HANDLE module, uint32_t ordinal, unsi
     return true;
 }
 
+/* O atalho de 403 tem dez instruções e usa o CTR. Copiar o corpo inteiro
+ * deixa o CTR e o LR do teclado intactos. */
+static bool hook_install_body(const char *name, HANDLE module, uint32_t ordinal, unsigned index,
+                              const void *hook, void **original) {
+    void *target = NULL;
+    const NTSTATUS resolved = module ? XexGetProcedureAddress(module, ordinal, &target) : STATUS_UNSUCCESSFUL;
+    size_t used = 0;
+    uint32_t *tramp;
+    if (!NT_SUCCESS(resolved) || !target || !MmIsAddressValid(target)) {
+        xsdk_plugin_log("pad: %s ordinal %u not resolved (status=0x%08X); hook not installed", name,
+                        (unsigned)ordinal, (unsigned)resolved);
+        return false;
+    }
+    tramp = &g_trampolines[index * PPC_DETOUR_TRAMPOLINE_WORDS];
+    *original = tramp;
+    if (!ppc_detour_install_body(&g_detours[index], (uint32_t *)target, (uint32_t)(uintptr_t)target,
+                                 (uint32_t)(uintptr_t)hook, tramp, (uint32_t)(uintptr_t)tramp,
+                                 PPC_DETOUR_TRAMPOLINE_WORDS, &used, code_flush)) {
+        *original = NULL;
+        xsdk_plugin_log("pad: %s ordinal %u at 0x%08X: body detour refused", name, (unsigned)ordinal,
+                        (unsigned)(uintptr_t)target);
+        return false;
+    }
+    xsdk_plugin_log("pad: %s ordinal %u at 0x%08X body hooked, trampoline %u words", name,
+                    (unsigned)ordinal, (unsigned)(uintptr_t)target, (unsigned)used);
+    return true;
+}
+
 /* Installs only the hooks whose ordinal resolved; the original is always set before the detour. */
 static void pad_hooks_install(void) {
     HANDLE kernel = 0, xam = 0;
@@ -783,6 +808,10 @@ static void pad_hooks_install(void) {
                  (const void *)hook_capabilities, (void **)&g_orig_capabilities);
     hook_install("XamInputSetState", xam, XAM_ORD_INPUT_SET_STATE, HOOK_SET_STATE,
                  (const void *)hook_set_state, (void **)&g_orig_set_state);
+    hook_install_body("XamInputGetKeystroke", xam, XAM_ORD_INPUT_GET_KEYSTROKE, HOOK_KEYSTROKE,
+                      (const void *)hook_keystroke, (void **)&g_orig_keystroke);
+    hook_install("XamInputGetKeystrokeHud", xam, XAM_ORD_INPUT_GET_KEYSTROKE_HUD, HOOK_KEYSTROKE_HUD,
+                 (const void *)hook_keystroke_hud, (void **)&g_orig_keystroke_hud);
     void *xenon = NULL;
     if (xam && NT_SUCCESS(XexGetProcedureAddress(xam, XAM_ORD_SEND_XENON_BUTTON, &xenon)) &&
         xenon && MmIsAddressValid(xenon)) {
@@ -839,16 +868,10 @@ static void pad_unbind(void) {
     g_guide_latched = false;
     g_guide_last_ms = 0u;
     g_player1_context = 0u;
-    g_swap_ms = 0u;
-    memset(&g_displaced, 0, sizeof g_displaced);
-    memset(&g_displaced_last, 0, sizeof g_displaced_last);
     memset(&g_swap_last, 0, sizeof g_swap_last);
 }
 
-/* O XAM devolve o usuario livre. Se ele nao e o jogador que escolhemos, o
- * controle fica aceso e nenhum botao sai. O usuario 0 de um jogador 2+ continua
- * sendo o controle oficial e nao entra aqui. */
-/* "Up": registers the DS4 context and checks which user XAM gave it. */
+/* O jogador é o usuário que o XAM entregou. O usuário 0 fica com o controle oficial. */
 static bool pad_bind(uint8_t player) {
     if (!g_layout_17559 || !g_bind_device) {
         if (!g_pad_logged_layout) {
@@ -861,10 +884,17 @@ static bool pad_bind(uint8_t player) {
     uint8_t user = X360_PAD_USER_INDEX_NONE;
     const uint32_t context = x360_pad_device_context(DS4_BIND_INDEX);
     const int result = g_bind_device(x360_pad_controller_id(DS4_BIND_INDEX), context, 0u, 0u, &user);
-    x360_pad_bind_verdict_t verdict = x360_pad_inject_check_bind(player, user);
-    /* O jogador gravado permanece. O XAM pode entregar outro usuário; os botões
-     * saem mesmo assim, e o jogador 1 é espelhado na leitura do usuário 0. */
-    if (verdict == X360_PAD_BIND_MISMATCH && user < 4u) verdict = X360_PAD_BIND_OK;
+    const uint8_t other = g_pad2_bound ? g_pad2_user : 0xFFu;
+    const uint8_t adopted = bt_player_for_bound_user(pair_official_on_player1(NULL), user, other);
+    x360_pad_bind_verdict_t verdict;
+    if (adopted != 0u) {
+        player = adopted;
+        verdict = X360_PAD_BIND_OK;
+    } else if (user == 0u) {
+        verdict = X360_PAD_BIND_OFFICIAL_SLOT;
+    } else {
+        verdict = x360_pad_inject_check_bind(player, user);
+    }
     xsdk_plugin_log("pad: bind result=%d userIndex=%u player=%u verdict=%u", result, (unsigned)user,
                     (unsigned)player, (unsigned)verdict);
     if (verdict != X360_PAD_BIND_OK) {
@@ -876,8 +906,15 @@ static bool pad_bind(uint8_t player) {
     }
     g_pad_bound = true;
     g_pad_bound_player = player;
+    g_pad_player = player;
     g_pad_user = user;
     g_pad_device_context = context;
+    if (g_session.player != player) {
+        g_session.player = player;
+        if (g_session.has_peer && bt_manager_set_player(&g_ipc, g_session.peer, player) >= 0)
+            pair_persist(NULL, &g_ipc);
+        xsdk_plugin_log("pad: auto player %u", (unsigned)player);
+    }
     xsdk_plugin_log("pad: DS4 context 0x%08X bound on user %u", (unsigned)context, (unsigned)user);
     if (!g_pad_logged_empty) {
         g_pad_logged_empty = true;
@@ -886,26 +923,8 @@ static bool pad_bind(uint8_t player) {
     return true;
 }
 
-/* Os dois gravados no mesmo número deixam o jogador 1 vazio. O primeiro ligado assume. */
-static void claim_player1(void) {
-    const bool primary_up = g_session.established &&
-                            g_session.player >= 1u && g_session.player <= 4u;
-    const bool second_up = g_session.second.established &&
-                           g_session.second.player >= 1u && g_session.second.player <= 4u;
-    if (g_player_pinned) return;
-    if (primary_up && g_session.player == 1u) return;
-    if (second_up && g_session.second.player == 1u) return;
-    if (!primary_up || !second_up || g_session.player != g_session.second.player) return;
-    g_session.player = 1u;
-    if (g_session.has_peer && bt_manager_set_player(&g_ipc, g_session.peer, 1u) >= 0)
-        pair_persist(NULL, &g_ipc);
-    g_player_pinned = true;
-    xsdk_plugin_log("pad: shared player split; first controller is player 1");
-}
-
 /* Plugin thread, every tick: mirrors the pairing session into XAM through x360_pad_inject. */
 static void pad_service(void) {
-    claim_player1();
     const bool authenticated = g_session.state == BT_PAIR_CONNECTED && g_session.established;
     if (g_session.player >= X360_PAD_PLAYER_MIN && g_session.player <= X360_PAD_PLAYER_MAX)
         g_pad_player = g_session.player;
@@ -945,7 +964,7 @@ static void pad_service(void) {
     }
     x360_pad_inject_publish(&g_pad, true, g_pad_player, &g_pad_report, g_pad_ps);
     /* O painel visível é o do perfil do controle oficial (usuário 0), não o do jogador 2. */
-    const bool guide_down = g_pad_ps;
+    const bool guide_down = g_pad_ps || g_pad2_ps;
     const uint32_t now = (uint32_t)now_ms();
     if (guide_down && g_xenon_press &&
         (!g_guide_was_down || now - g_guide_last_ms >= 1000u)) {
@@ -976,8 +995,17 @@ static bool pad2_bind(uint8_t player) {
     uint8_t user = X360_PAD_USER_INDEX_NONE;
     const uint32_t context = x360_pad_device_context(DS4_BIND_INDEX_2);
     const int result = g_bind_device(x360_pad_controller_id(DS4_BIND_INDEX_2), context, 0u, 0u, &user);
-    x360_pad_bind_verdict_t verdict = x360_pad_inject_check_bind(player, user);
-    if (verdict == X360_PAD_BIND_MISMATCH && user < 4u) verdict = X360_PAD_BIND_OK;
+    const uint8_t other = g_pad_bound ? g_pad_user : 0xFFu;
+    const uint8_t adopted = bt_player_for_bound_user(pair_official_on_player1(NULL), user, other);
+    x360_pad_bind_verdict_t verdict;
+    if (adopted != 0u) {
+        player = adopted;
+        verdict = X360_PAD_BIND_OK;
+    } else if (user == 0u) {
+        verdict = X360_PAD_BIND_OFFICIAL_SLOT;
+    } else {
+        verdict = x360_pad_inject_check_bind(player, user);
+    }
     xsdk_plugin_log("pad: second bind result=%d userIndex=%u player=%u verdict=%u", result,
                     (unsigned)user, (unsigned)player, (unsigned)verdict);
     if (verdict != X360_PAD_BIND_OK) {
@@ -986,8 +1014,15 @@ static bool pad2_bind(uint8_t player) {
     }
     g_pad2_bound = true;
     g_pad2_bound_player = player;
+    g_pad2_player = player;
     g_pad2_user = user;
     g_pad2_context = context;
+    if (g_session.second.player != player) {
+        g_session.second.player = player;
+        if (bt_manager_set_player(&g_ipc, g_session.second.peer, player) >= 0)
+            pair_persist(NULL, &g_ipc);
+        xsdk_plugin_log("pad: auto player %u", (unsigned)player);
+    }
     xsdk_plugin_log("pad: second DS4 context 0x%08X bound on user %u", (unsigned)context,
                     (unsigned)user);
     return true;
@@ -1425,7 +1460,6 @@ void plugin_main(HANDLE module) {
                             const bt_paired_device_t *primary;
                             const bt_paired_device_t *second;
                             pair_persist(NULL, &g_ipc);
-                            g_player_pinned = true;
                             primary = g_session.has_peer
                                           ? bt_manager_find_paired(&g_ipc, g_session.peer) : NULL;
                             second = g_session.second.active
